@@ -1,0 +1,246 @@
+name: Pre-production Docker
+
+on:
+  push:
+    branches:
+      - pre
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ak2api-pre-production
+  cancel-in-progress: true
+
+env:
+  IMAGE_REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: btcfoxman
+  IMAGE_NAME: ak2api
+  IMAGE_REF: ghcr.io/btcfoxman/ak2api
+  AK2API_HOSTNAME: ak2api.aiid.edu.kg
+  AK2API_ORIGIN: http://127.0.0.1:8795
+  CLOUDFLARED_CONFIG: /etc/cloudflared/config.yml
+
+jobs:
+  build:
+    name: Build and Push Image
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ github.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.IMAGE_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_REF }}:${{ github.sha }}
+            ${{ env.IMAGE_REF }}:latest
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+  deploy:
+    name: Pull and Start on 192.168.3.5
+    needs: build
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - ak2api-pre
+    env:
+      DEPLOY_PATH: /home/btcfoxman/docker/ak2api
+      DEPLOY_SERVICE: ak2api
+      IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.IMAGE_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull and restart service
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$DEPLOY_PATH"
+          test -f docker-compose.yml
+          test -f .env
+
+          env_checksum="$(sha256sum .env | awk '{print $1}')"
+          compose_checksum="$(sha256sum docker-compose.yml | awk '{print $1}')"
+
+          export IMAGE_REGISTRY IMAGE_NAMESPACE IMAGE_NAME IMAGE_TAG
+          docker network inspect my-shared-net >/dev/null 2>&1 || docker network create my-shared-net
+          for attempt in 1 2 3; do
+            if docker compose pull "$DEPLOY_SERVICE"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep $((attempt * 20))
+          done
+          docker tag "${IMAGE_REGISTRY}/${IMAGE_NAMESPACE}/${IMAGE_NAME}:${IMAGE_TAG}" \
+            "${IMAGE_REGISTRY}/${IMAGE_NAMESPACE}/${IMAGE_NAME}:latest"
+          docker compose up -d --remove-orphans "$DEPLOY_SERVICE"
+          docker image prune -f
+
+          test "$env_checksum" = "$(sha256sum .env | awk '{print $1}')"
+          test "$compose_checksum" = "$(sha256sum docker-compose.yml | awk '{print $1}')"
+
+      - name: Verify browser and proxy runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker exec -i ak2api python - <<'PY'
+          import os
+          import socket
+
+          assert os.environ["AK_CHROME_EXECUTABLE"] == "/usr/bin/chromium"
+          assert os.environ["AK_CHROME_USER_DATA_ROOT"] == "/app/data/ak-chrome-profiles"
+          assert os.environ["AK_PROXY_HOST_OVERRIDE"] == "host.docker.internal"
+          assert os.environ["AK_CHROME_CDP_BASE_PORT"] == "19800"
+
+          proxies = [value.strip() for value in os.environ["AK_PROXY_POOL"].replace(";", ",").split(",") if value.strip()]
+          assert proxies, "AK_PROXY_POOL must contain at least one proxy"
+          for value in proxies:
+              host, port = value.removeprefix("socks5://").rsplit(":", 1)
+              with socket.create_connection((host, int(port)), timeout=2):
+                  pass
+          PY
+
+      - name: Verify container status
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$DEPLOY_PATH"
+          for attempt in $(seq 1 30); do
+            status="$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' ak2api 2>/dev/null || true)"
+            if [ "$status" = "healthy" ] || [ "$status" = "running" ]; then
+              if curl -fsS "http://127.0.0.1:8795/health" >/dev/null; then
+                exit 0
+              fi
+            fi
+            echo "Waiting for ak2api (attempt ${attempt}/30)"
+            sleep 5
+          done
+
+          docker ps -a --filter name=ak2api
+          docker logs --tail 120 ak2api || true
+          exit 1
+
+      - name: Configure cloudflared ingress
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo test -f "$CLOUDFLARED_CONFIG"
+          tmp="$(mktemp)"
+          trap 'rm -f "$tmp"' EXIT
+          sudo cat "$CLOUDFLARED_CONFIG" > "$tmp"
+
+          CLOUDFLARED_TMP="$tmp" python3 - <<'PY'
+          from pathlib import Path
+          import os
+
+          path = Path(os.environ["CLOUDFLARED_TMP"])
+          hostname = os.environ["AK2API_HOSTNAME"]
+          service = os.environ["AK2API_ORIGIN"]
+          lines = path.read_text(encoding="utf-8").splitlines()
+
+          if not any(line.strip() == "ingress:" for line in lines):
+              raise SystemExit("cloudflared config has no ingress section")
+
+          route_line = f"- hostname: {hostname}"
+          route_index = next(
+              (index for index, line in enumerate(lines) if line.strip() == route_line),
+              None,
+          )
+          if route_index is None:
+              insert_at = next(
+                  (
+                      index
+                      for index, line in enumerate(lines)
+                      if line.strip() == "- service: http_status:404"
+                  ),
+                  len(lines),
+              )
+              lines[insert_at:insert_at] = [
+                  f"  - hostname: {hostname}",
+                  f"    service: {service}",
+              ]
+          else:
+              service_index = None
+              for index in range(route_index + 1, len(lines)):
+                  stripped = lines[index].strip()
+                  if stripped.startswith("- "):
+                      break
+                  if stripped.startswith("service:"):
+                      service_index = index
+                      break
+              if service_index is None:
+                  lines.insert(route_index + 1, f"    service: {service}")
+              else:
+                  indent = lines[service_index][: len(lines[service_index]) - len(lines[service_index].lstrip())]
+                  lines[service_index] = f"{indent}service: {service}"
+
+          path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+
+          if ! cmp -s "$tmp" <(sudo cat "$CLOUDFLARED_CONFIG"); then
+            sudo cp "$CLOUDFLARED_CONFIG" "${CLOUDFLARED_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
+            sudo install -m 600 -o root -g root "$tmp" "$CLOUDFLARED_CONFIG"
+          fi
+
+          sudo cloudflared tunnel --config "$CLOUDFLARED_CONFIG" ingress validate
+          tunnel_id="$(sudo awk '/^tunnel:/ {print $2; exit}' "$CLOUDFLARED_CONFIG" || true)"
+          if [ -n "$tunnel_id" ]; then
+            origin_cert="${HOME}/.cloudflared/cert.pem"
+            if [ -f "$origin_cert" ]; then
+              cloudflared --origincert "$origin_cert" tunnel route dns "$tunnel_id" "$AK2API_HOSTNAME" || true
+            else
+              sudo cloudflared tunnel route dns "$tunnel_id" "$AK2API_HOSTNAME" || true
+            fi
+          fi
+          sudo systemctl restart cloudflared
+
+      - name: Verify public HTTPS endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          url="https://${AK2API_HOSTNAME}/health"
+          for attempt in $(seq 1 30); do
+            if curl -fsS --max-time 10 "$url" >/dev/null; then
+              exit 0
+            fi
+            echo "Waiting for ${url} (attempt ${attempt}/30)"
+            sleep 5
+          done
+
+          sudo systemctl status cloudflared --no-pager || true
+          curl -v --max-time 15 "$url" || true
+          exit 1

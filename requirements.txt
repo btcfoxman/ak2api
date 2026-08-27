@@ -1,0 +1,8 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+requests==2.32.3
+Pillow==11.2.1
+PySocks>=1.7.1
+websocket-client>=1.8.0
+python-multipart==0.0.20
+pydantic==2.11.4

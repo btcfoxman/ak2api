@@ -1,0 +1,38 @@
+services:
+  ak2api:
+    image: ${IMAGE_REGISTRY:-ghcr.io}/${IMAGE_NAMESPACE:-btcfoxman}/${IMAGE_NAME:-ak2api}:${IMAGE_TAG:-latest}
+    container_name: ${AK2API_CONTAINER_NAME:-ak2api}
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Asia/Taipei}
+      PYTHONUNBUFFERED: "1"
+      AK_CHROME_EXECUTABLE: ${AK_CHROME_EXECUTABLE:-/usr/bin/chromium}
+      AK_CHROME_USER_DATA_ROOT: /app/data/ak-chrome-profiles
+      AK_PROXY_HOST_OVERRIDE: ${AK_PROXY_HOST_OVERRIDE:-host.docker.internal}
+      AK_MODEL_MAP: ${AK_MODEL_MAP:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/app/data
+    shm_size: "512mb"
+    ports:
+      - "${AK2API_PORT:-8795}:8795"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8795/health', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - my-shared-net
+
+networks:
+  my-shared-net:
+    external: true
