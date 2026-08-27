@@ -7,8 +7,10 @@ import subprocess
 import threading
 import time
 import urllib.request
+from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import websocket
 
@@ -28,13 +30,23 @@ class AkoolBrowserChallengeError(AkoolBrowserError):
     pass
 
 
+class AkoolBrowserTransportError(AkoolBrowserError):
+    pass
+
+
 class _CDP:
     def __init__(self, url: str, timeout: float = 20):
-        self.socket = websocket.create_connection(
-            url,
-            timeout=timeout,
-            suppress_origin=True,
-        )
+        try:
+            self.socket = websocket.create_connection(
+                url,
+                timeout=timeout,
+                suppress_origin=True,
+                enable_multithread=False,
+            )
+        except Exception as exc:
+            raise AkoolBrowserTransportError(
+                f"CDP WebSocket connection failed: {exc}"
+            ) from exc
         self.command_id = 0
         self.timeout = timeout
 
@@ -53,16 +65,24 @@ class _CDP:
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
             try:
-                payload = json.loads(self.socket.recv())
-            except TimeoutError as exc:
-                raise AkoolBrowserError(f"CDP {method} timed out") from exc
+                self.socket.settimeout(max(min(deadline - time.monotonic(), 1), 0.05))
+                raw = self.socket.recv()
+                if not raw:
+                    continue
+                payload = json.loads(raw)
+            except websocket.WebSocketTimeoutException:
+                continue
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                raise AkoolBrowserTransportError(
+                    f"CDP {method} transport failed: {exc}"
+                ) from exc
             if payload.get("id") != command_id:
                 continue
             if payload.get("error"):
                 message = payload["error"].get("message") or payload["error"]
-                raise AkoolBrowserError(f"CDP {method} failed: {message}")
+                raise AkoolBrowserTransportError(f"CDP {method} failed: {message}")
             return payload.get("result") or {}
-        raise AkoolBrowserError(f"CDP {method} timed out")
+        raise AkoolBrowserTransportError(f"CDP {method} timed out")
 
     def evaluate(self, expression: str) -> Any:
         value = self.call(
@@ -82,6 +102,12 @@ class _CDP:
 
 _managed: dict[int, subprocess.Popen[Any]] = {}
 _managed_lock = threading.RLock()
+_account_locks: dict[int, threading.RLock] = {}
+
+
+def _account_lock(account_id: int) -> threading.RLock:
+    with _managed_lock:
+        return _account_locks.setdefault(int(account_id), threading.RLock())
 
 
 def _chrome_executable(configured: str) -> str:
@@ -157,15 +183,86 @@ def _wait_target(port: int, timeout: int) -> dict[str, Any]:
                     for item in targets
                     if item.get("type") == "page"
                     and item.get("webSocketDebuggerUrl")
+                    and "akool.com" in str(item.get("url") or "")
                 ),
                 None,
             )
+            if page is None:
+                page = next(
+                    (
+                        item
+                        for item in targets
+                        if item.get("type") == "page"
+                        and item.get("webSocketDebuggerUrl")
+                    ),
+                    None,
+                )
             if page:
                 return page
         except Exception as exc:
             last_error = str(exc)
         time.sleep(0.5)
-    raise AkoolBrowserError(f"Chrome did not establish CDP on port {port}: {last_error}")
+    raise AkoolBrowserTransportError(
+        f"Chrome did not establish CDP on port {port}: {last_error}"
+    )
+
+
+def _endpoint_ready(port: int) -> bool:
+    try:
+        _cdp_json(int(port), "/json/version", 1)
+        return True
+    except Exception:
+        return False
+
+
+def _profile_process_running(profile_dir: Path) -> bool:
+    if os.name == "nt":
+        return False
+    expected = profile_dir.resolve()
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return False
+    for process_dir in proc_root.iterdir():
+        if not process_dir.name.isdigit():
+            continue
+        try:
+            arguments = (process_dir / "cmdline").read_bytes().split(b"\0")
+        except (OSError, PermissionError):
+            continue
+        for argument in arguments:
+            if not argument.startswith(b"--user-data-dir="):
+                continue
+            try:
+                candidate = Path(os.fsdecode(argument.split(b"=", 1)[1])).resolve()
+            except (OSError, ValueError):
+                continue
+            if candidate == expected:
+                return True
+    return False
+
+
+def _clear_stale_profile_singletons(profile_dir: Path) -> list[str]:
+    if os.name == "nt" or _profile_process_running(profile_dir):
+        return []
+    removed: list[str] = []
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        artifact = profile_dir / name
+        try:
+            if artifact.is_symlink() or artifact.is_file():
+                artifact.unlink()
+                removed.append(name)
+        except FileNotFoundError:
+            continue
+    return removed
+
+
+def _chrome_log_excerpt(path: Path, limit: int = 1200) -> str:
+    try:
+        content = path.read_bytes()[-16_384:].decode("utf-8", "replace")
+    except OSError:
+        return ""
+    lines = [" ".join(line.split()) for line in content.splitlines() if line.strip()]
+    return " | ".join(lines[-4:])[-limit:]
 
 
 def _launch(
@@ -173,50 +270,64 @@ def _launch(
 ) -> tuple[subprocess.Popen[Any] | None, int]:
     account_id = int(account["id"])
     port = _cdp_port(account, settings)
-    try:
-        _cdp_json(port, "/json/version", 1)
+    if _endpoint_ready(port):
         return None, port
-    except Exception:
-        pass
 
     profile = _profile_path(account, settings)
     profile.mkdir(parents=True, exist_ok=True)
+    _clear_stale_profile_singletons(profile)
     proxy = rewrite_loopback_proxy(
         normalize_proxy_url(str(account.get("proxy_url") or "")),
         str(settings.proxy_host_override or ""),
     )
+    if proxy:
+        parsed_proxy = urlsplit(proxy)
+        if parsed_proxy.username or parsed_proxy.password:
+            raise AkoolBrowserError(
+                "authenticated Chrome proxies require a local unauthenticated bridge"
+            )
     command = [
         _chrome_executable(str(settings.chrome_executable or "")),
         f"--remote-debugging-port={port}",
         f"--user-data-dir={profile}",
+        "--profile-directory=Default",
         "--remote-allow-origins=*",
         "--no-first-run",
         "--no-default-browser-check",
-        "--disable-background-networking",
-        "--no-sandbox",
+        "--disable-background-mode",
     ]
     if proxy:
         command.append(f"--proxy-server={proxy}")
     if bool(settings.chrome_headless):
-        command.extend(["--headless=new", "--disable-gpu"])
+        command.extend(["--headless=new", "--window-size=1280,960"])
+    if os.name != "nt":
+        command.extend(["--no-sandbox", "--disable-dev-shm-usage"])
     command.append(AKOOL_LOGIN_PAGE)
-    creationflags = 0
-    if os.name == "nt" and bool(settings.chrome_headless):
-        creationflags = subprocess.CREATE_NO_WINDOW
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=creationflags,
-    )
+    chrome_log_path = profile / "chrome-launch.log"
+    with chrome_log_path.open("ab", buffering=0) as chrome_log:
+        chrome_log.write(
+            f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] launching Chrome\n".encode()
+        )
+        process = subprocess.Popen(
+            command,
+            stdout=chrome_log,
+            stderr=subprocess.STDOUT,
+            creationflags=(
+                getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                if os.name == "nt" and bool(settings.chrome_headless)
+                else 0
+            ),
+        )
     with _managed_lock:
         _managed[account_id] = process
     try:
         _wait_target(port, min(int(settings.browser_timeout_seconds), 45))
     except Exception:
         if process.poll() is not None:
-            raise AkoolBrowserError(
+            detail = _chrome_log_excerpt(chrome_log_path)
+            raise AkoolBrowserTransportError(
                 f"Google Chrome exited before CDP became ready ({process.returncode})"
+                + (f": {detail}" if detail else "")
             )
         raise
     return process, port
@@ -225,6 +336,16 @@ def _launch(
 def _safe_cookie_records(account: dict[str, Any]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     records = cookie_records(account.get("cookie_records") or account.get("cookies_json"))
+    if not records and str(account.get("cookie_header") or "").strip():
+        parsed = SimpleCookie()
+        try:
+            parsed.load(str(account.get("cookie_header") or ""))
+        except Exception:
+            parsed = SimpleCookie()
+        records = [
+            {"name": name, "value": morsel.value, "domain": ".akool.com", "path": "/"}
+            for name, morsel in parsed.items()
+        ]
     for item in records:
         name = str(item.get("name") or "").strip()
         value = item.get("value")
@@ -255,8 +376,31 @@ def _safe_cookie_records(account: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _page_state(client: _CDP) -> dict[str, Any]:
     raw = client.evaluate(
-        "JSON.stringify({url:location.href,ua:navigator.userAgent||'',"
-        "title:document.title||'',text:(document.body&&document.body.innerText||'').slice(0,5000)})"
+        r"""
+JSON.stringify((() => {
+  const visible = (el) => Boolean(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+  const text = (document.body && document.body.innerText || '').slice(0, 5000);
+  const email = [...document.querySelectorAll('input[type="email"],input[name="email"],input[autocomplete="email"]')].find(visible);
+  const password = [...document.querySelectorAll('input[type="password"],input[name="password"],input[autocomplete="current-password"]')].find(visible);
+  const iframeChallenge = [...document.querySelectorAll('iframe')].some((item) => {
+    if (!/cloudflare|turnstile|challenge/i.test(`${item.src || ''} ${item.title || ''}`)) return false;
+    const rect = item.getBoundingClientRect();
+    return visible(item) && rect.width >= 120 && rect.height >= 40;
+  });
+  const challenge = iframeChallenge || /verify you are human|security checkpoint|checking your browser|please confirm you are human/i.test(`${document.title || ''}\n${text}`);
+  const invalidCredentials = /incorrect password|invalid (?:email|account|credentials)|account does not exist|wrong password|邮箱或密码|账号或密码/i.test(text);
+  return {
+    url: location.href,
+    ua: navigator.userAgent || '',
+    title: document.title || '',
+    text,
+    hasEmail: Boolean(email),
+    hasPassword: Boolean(password),
+    hasChallenge: Boolean(challenge),
+    invalidCredentials: Boolean(invalidCredentials)
+  };
+})())
+        """
     )
     try:
         return json.loads(str(raw or "{}"))
@@ -323,119 +467,159 @@ def _attempt_login(client: _CDP, email: str, password: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _click_turnstile(client: _CDP) -> bool:
-    try:
-        targets = client.call("Target.getTargets").get("targetInfos") or []
-        iframe = next(
-            (
-                item
-                for item in targets
-                if "challenges.cloudflare.com" in str(item.get("url") or "")
-            ),
-            None,
-        )
-        if not iframe:
-            return False
-        # The widget normally handles itself. A real click is only attempted on the
-        # visible iframe center; no challenge token is fabricated.
-        rect = client.evaluate(
-            "(() => {const f=[...document.querySelectorAll('iframe')].find(x=>x.src.includes('challenges.cloudflare.com'));"
-            "if(!f)return null;const r=f.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2,w:r.width,h:r.height};})()"
-        )
-        if not isinstance(rect, dict) or not rect.get("w") or not rect.get("h"):
-            return False
-        params = {"x": float(rect["x"]), "y": float(rect["y"]), "button": "left", "clickCount": 1}
-        client.call("Input.dispatchMouseEvent", {**params, "type": "mousePressed"})
-        client.call("Input.dispatchMouseEvent", {**params, "type": "mouseReleased"})
-        return True
-    except Exception:
-        return False
-
-
 def refresh_account_context(account: dict[str, Any], settings: Any) -> dict[str, Any]:
-    _, port = _launch(account, settings)
-    target = _wait_target(port, int(settings.browser_timeout_seconds))
-    client = _CDP(str(target["webSocketDebuggerUrl"]), timeout=30)
+    account_id = int(account.get("id") or 0)
+    if not account_id:
+        raise AkoolBrowserError("CDP login requires a persisted account id")
+    with _account_lock(account_id):
+        port = _cdp_port(account, settings)
+        profile = _profile_path(account, settings)
+        client = _open_cdp_with_recovery(account, settings, port, profile)
+        try:
+            imported = _safe_cookie_records(account)
+            if imported:
+                client.call("Network.setCookies", {"cookies": imported})
+            client.call("Page.navigate", {"url": AKOOL_LOGIN_PAGE})
+            deadline = time.monotonic() + int(settings.browser_timeout_seconds)
+            last_submit_at = 0.0
+            last_open_at = 0.0
+            challenge_started_at: float | None = None
+            submitted = False
+            last_form_signature: tuple[bool, bool] | None = None
+            last_page: dict[str, Any] = {}
+            last_error = ""
+            while time.monotonic() < deadline:
+                try:
+                    verified = _browser_verify(client)
+                    body = verified.get("body") or {}
+                    if int(body.get("code") or 0) == 1000:
+                        data = body.get("data") or {}
+                        user = data.get("user") or {}
+                        team = data.get("team") or {}
+                        latest = [
+                            item
+                            for item in list(
+                                (client.call("Network.getAllCookies") or {}).get("cookies")
+                                or []
+                            )
+                            if str(item.get("domain") or "")
+                            .lstrip(".")
+                            .endswith("akool.com")
+                        ]
+                        page = _page_state(client)
+                        return {
+                            "cookie_header": cookie_header_from_records(latest),
+                            "cookie_records": latest,
+                            "cookies_json": latest,
+                            "access_token": str(data.get("token") or ""),
+                            "user_id": str(user.get("_id") or ""),
+                            "team_id": str(team.get("_id") or ""),
+                            "email": str(
+                                user.get("email") or account.get("email") or ""
+                            ),
+                            "user_agent": str(
+                                page.get("ua") or account.get("user_agent") or ""
+                            ),
+                            "profile_dir": str(profile),
+                            "cdp_port": port,
+                            "status": "pending",
+                            "last_error": "",
+                            "last_login_at": int(time.time()),
+                        }
+                    last_error = str(
+                        verified.get("error")
+                        or body.get("msg")
+                        or body.get("message")
+                        or ""
+                    )
+                except AkoolBrowserTransportError:
+                    raise
+                except Exception as exc:
+                    last_error = str(exc)
+
+                last_page = _page_state(client)
+                now = time.monotonic()
+                if last_page.get("hasChallenge"):
+                    challenge_started_at = challenge_started_at or now
+                    if now - challenge_started_at >= int(
+                        settings.browser_challenge_grace_seconds
+                    ):
+                        detail = " ".join(
+                            str(last_page.get("text") or "").split()
+                        )[:240]
+                        raise AkoolBrowserChallengeError(
+                            "Akool browser challenge requires manual verification"
+                            + (f": {detail}" if detail else "")
+                            + f"; last page={last_page.get('url') or '<unknown>'}"
+                        )
+                    time.sleep(1)
+                    continue
+                challenge_started_at = None
+                if last_page.get("invalidCredentials") and submitted:
+                    raise AkoolBrowserError("Akool rejected the email or password")
+
+                signature = (
+                    bool(last_page.get("hasEmail")),
+                    bool(last_page.get("hasPassword")),
+                )
+                if signature != last_form_signature:
+                    submitted = False
+                    last_form_signature = signature
+                if account.get("email") and account.get("password"):
+                    if any(signature) and (not submitted or now - last_submit_at >= 30):
+                        result = _attempt_login(
+                            client,
+                            str(account.get("email") or ""),
+                            str(account.get("password") or ""),
+                        )
+                        submitted = bool(result.get("submitted"))
+                        last_submit_at = now
+                    elif not any(signature) and now - last_open_at >= 5:
+                        _attempt_login(
+                            client,
+                            str(account.get("email") or ""),
+                            str(account.get("password") or ""),
+                        )
+                        last_open_at = now
+                time.sleep(1)
+
+            raise AkoolBrowserError(
+                "Akool login did not produce a valid session"
+                f"; last page={last_page.get('url') or '<unknown>'}"
+                + (f"; {last_error}" if last_error else "")
+            )
+        finally:
+            client.close()
+
+
+def _open_cdp_with_recovery(
+    account: dict[str, Any], settings: Any, port: int, profile: Path
+) -> _CDP:
+    if not _endpoint_ready(port):
+        _launch(account, settings)
     try:
+        target = _wait_target(port, min(int(settings.browser_timeout_seconds), 60))
+        client = _CDP(str(target["webSocketDebuggerUrl"]), timeout=30)
         client.call("Network.enable")
         client.call("Page.enable")
-        imported = _safe_cookie_records(account)
-        if imported:
-            client.call("Network.setCookies", {"cookies": imported})
-        client.call("Page.navigate", {"url": AKOOL_LOGIN_PAGE})
-        deadline = time.monotonic() + int(settings.browser_timeout_seconds)
-        next_login_attempt = 0.0
-        clicked_turnstile = False
-        last_page: dict[str, Any] = {}
-        last_error = ""
-        while time.monotonic() < deadline:
-            try:
-                verified = _browser_verify(client)
-                body = verified.get("body") or {}
-                if int(body.get("code") or 0) == 1000:
-                    data = body.get("data") or {}
-                    user = data.get("user") or {}
-                    team = data.get("team") or {}
-                    latest = list(
-                        (client.call("Network.getAllCookies") or {}).get("cookies") or []
-                    )
-                    page = _page_state(client)
-                    return {
-                        "cookie_header": cookie_header_from_records(latest),
-                        "cookie_records": latest,
-                        "cookies_json": latest,
-                        "access_token": str(data.get("token") or ""),
-                        "user_id": str(user.get("_id") or ""),
-                        "team_id": str(team.get("_id") or ""),
-                        "email": str(user.get("email") or account.get("email") or ""),
-                        "user_agent": str(page.get("ua") or account.get("user_agent") or ""),
-                        "profile_dir": str(_profile_path(account, settings)),
-                        "cdp_port": port,
-                        "status": "pending",
-                        "last_error": "",
-                        "last_login_at": int(time.time()),
-                    }
-                last_error = str(verified.get("error") or body.get("msg") or "")
-            except Exception as exc:
-                last_error = str(exc)
-
-            last_page = _page_state(client)
-            page_text = str(last_page.get("text") or "").lower()
-            if any(
-                marker in page_text
-                for marker in (
-                    "verify you are human",
-                    "security checkpoint",
-                    "checking your browser",
-                )
-            ):
-                clicked_turnstile = _click_turnstile(client) or clicked_turnstile
-                if bool(settings.chrome_headless):
-                    raise AkoolBrowserChallengeError(
-                        "Akool browser challenge requires an interactive Chrome; "
-                        f"last page={last_page.get('url') or ''}"
-                    )
-
-            now = time.monotonic()
-            if account.get("email") and account.get("password") and now >= next_login_attempt:
-                result = _attempt_login(
-                    client,
-                    str(account.get("email") or ""),
-                    str(account.get("password") or ""),
-                )
-                next_login_attempt = now + (4 if result.get("phase") == "open-login" else 15)
-            time.sleep(1)
-
-        challenge = " (Turnstile was detected)" if clicked_turnstile else ""
-        raise AkoolBrowserError(
-            "Akool login did not produce a valid session"
-            f"{challenge}; last page={last_page.get('url') or ''}; {last_error}"
-        )
-    finally:
-        client.close()
+        return client
+    except AkoolBrowserTransportError:
+        _stop_managed_browser_unlocked(int(account["id"]), port)
+        _wait_for_endpoint_closed(port)
+        _launch(account, settings)
+        try:
+            target = _wait_target(port, min(int(settings.browser_timeout_seconds), 60))
+            client = _CDP(str(target["webSocketDebuggerUrl"]), timeout=30)
+            client.call("Network.enable")
+            client.call("Page.enable")
+            return client
+        except Exception as exc:
+            raise AkoolBrowserTransportError(
+                f"CDP recovery failed after browser restart: {exc}"
+            ) from exc
 
 
-def stop_managed_browser(account_id: int, cdp_port: int) -> bool:
+def _stop_managed_browser_unlocked(account_id: int, cdp_port: int) -> bool:
     stopped = False
     if cdp_port:
         try:
@@ -465,34 +649,90 @@ def stop_managed_browser(account_id: int, cdp_port: int) -> bool:
     return stopped
 
 
-def delete_managed_profile(account: dict[str, Any], settings: Any) -> None:
+def stop_managed_browser(account_id: int, cdp_port: int) -> bool:
+    with _account_lock(int(account_id)):
+        return _stop_managed_browser_unlocked(int(account_id), int(cdp_port or 0))
+
+
+def _wait_for_endpoint_closed(cdp_port: int, timeout: float = 5) -> None:
+    deadline = time.monotonic() + timeout
+    while _endpoint_ready(cdp_port) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if _endpoint_ready(cdp_port):
+        raise AkoolBrowserTransportError(
+            "Google Chrome did not stop before profile reset"
+        )
+
+
+def _managed_profile_child(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return path != root
+
+
+def _remove_profile(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def delete_managed_profile(account: dict[str, Any], settings: Any) -> dict[str, Any]:
     account_id = int(account["id"])
-    stop_managed_browser(account_id, _cdp_port(account, settings))
-    profile = _profile_path(account, settings)
-    root = Path(settings.chrome_user_data_root).resolve()
-    if profile == root or root not in profile.parents:
-        if account.get("profile_dir"):
-            raise ValueError("refusing to delete a profile outside the managed root")
-        return
-    if profile.exists():
-        shutil.rmtree(profile)
+    with _account_lock(account_id):
+        port = _cdp_port(account, settings)
+        stopped = _stop_managed_browser_unlocked(account_id, port)
+        _wait_for_endpoint_closed(port)
+        root = Path(settings.chrome_user_data_root).resolve()
+        target = (root / f"account-{account_id}").resolve()
+        current = _profile_path(account, settings)
+        removed: list[str] = []
+        for profile in dict.fromkeys((current, target)):
+            if not _managed_profile_child(profile, root) or not profile.exists():
+                continue
+            _remove_profile(profile)
+            removed.append(str(profile))
+        return {
+            "browser_stopped": stopped,
+            "removed_profiles": removed,
+            "external_profile_preserved": (
+                str(current)
+                if current.exists() and not _managed_profile_child(current, root)
+                else ""
+            ),
+        }
 
 
 def reset_managed_profile(account: dict[str, Any], settings: Any) -> dict[str, Any]:
-    delete_managed_profile(account, settings)
-    profile = _profile_path({**account, "profile_dir": ""}, settings)
-    profile.mkdir(parents=True, exist_ok=True)
-    return {"profile_dir": str(profile), "cdp_port": _cdp_port(account, settings)}
+    account_id = int(account["id"])
+    with _account_lock(account_id):
+        deletion = delete_managed_profile(account, settings)
+        profile = _profile_path({**account, "profile_dir": ""}, settings)
+        if profile.exists():
+            _remove_profile(profile)
+        profile.mkdir(parents=True, exist_ok=False)
+        return {
+            "profile_dir": str(profile),
+            "cdp_port": _cdp_port(account, settings),
+            **deletion,
+        }
 
 
 def shutdown_managed_browsers() -> None:
     with _managed_lock:
-        items = list(_managed.items())
-    for account_id, process in items:
-        if process.poll() is None:
-            try:
-                process.terminate()
-            except Exception:
-                pass
-        with _managed_lock:
-            _managed.pop(account_id, None)
+        account_ids = list(_managed)
+    for account_id in account_ids:
+        with _account_lock(account_id):
+            with _managed_lock:
+                process = _managed.pop(account_id, None)
+            if process and process.poll() is None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except Exception:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass

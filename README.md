@@ -5,7 +5,7 @@ Akool 多素材视频生成协议网关。项目以真实 Chrome Profile + CDP �
 ## 能力
 
 - 账号账密、Cookie、固定代理和独立浏览器 Profile 导入。
-- 批量格式支持 `email|password|proxy` 和 `email----password----proxy`。
+- 批量格式支持 `email|password|proxy`、`email----password----proxy`、逗号和 Tab 分隔，也可向接口提交 JSON 账号数组。
 - 未指定代理时，从代理池按账号分配数量均衡绑定。
 - Seedance 2.0 Mini/Fast/标准、Seedance 2.5 Reference、Minimax H3。
 - 图片、视频、音频 URL 或 data URL/base64 素材。
@@ -40,7 +40,7 @@ user@example.com|password|socks5://xray:20001
 user2@example.com----password----socks5://xray:20002
 ```
 
-每个账号固定代理、Profile 和 CDP 端口。Chrome 在 Akool 页面中填写账密并由网站脚本完成密码加密和 invisible Turnstile；系统不会构造或复用 Turnstile token。遇到交互式验证时，账号状态会标记为需登录，可打开同一 Profile 完成人工确认后重新检测。
+每个账号固定代理、Profile 和 CDP 端口。Chrome 在 Akool 页面中填写账密并由网站脚本完成密码加密和 invisible Turnstile；系统不会构造或复用 Turnstile token。登录按设置中的并发和错峰参数执行，同一账号不会重复启动登录。遇到交互式验证时，账号会标记为“需验证”并保留同一 Profile，确认后可重新检测；CDP 传输失败会使用同一 Profile 重启一次。
 
 Docker 内可使用 `xray:20001`，会归一化为 `socks5://xray:20001`。宿主机回环代理通过 `AK_PROXY_HOST_OVERRIDE=host.docker.internal` 改写。
 

@@ -248,11 +248,28 @@ def sync_account(payload: AccountSyncRequest) -> dict[str, Any]:
 
 @app.post("/api/accounts/batch-import", dependencies=[Depends(_admin_token)])
 def batch_import(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    return service.batch_import(
-        str(payload.get("text") or ""),
-        start_login=bool(payload.get("start_login", True)),
-        use_proxy_pool=bool(payload.get("use_proxy_pool", True)),
-    )
+    try:
+        raw_accounts = payload.get("accounts")
+        if isinstance(raw_accounts, list):
+            source: str | list[dict[str, Any]] = [
+                AccountUpsert.model_validate(
+                    {
+                        **item,
+                        "name": str(item.get("name") or item.get("email") or ""),
+                    }
+                ).model_dump()
+                for item in raw_accounts
+                if isinstance(item, dict)
+            ]
+        else:
+            source = str(payload.get("text") or "")
+        return service.batch_import(
+            source,
+            start_login=bool(payload.get("start_login", True)),
+            use_proxy_pool=bool(payload.get("use_proxy_pool", True)),
+        )
+    except Exception as exc:
+        raise _detail(exc) from exc
 
 
 @app.patch("/api/accounts/{account_id}", dependencies=[Depends(_admin_token)])
@@ -290,8 +307,8 @@ def refresh_balance(account_id: int) -> dict[str, Any]:
 def reconnect_account(account_id: int) -> dict[str, Any]:
     if not database.get_account(account_id):
         raise HTTPException(status_code=404, detail="account not found")
-    service.schedule_login(account_id)
-    return {"accepted": True, "account_id": account_id}
+    started = service.schedule_login(account_id)
+    return {"accepted": True, "started": started, "account_id": account_id}
 
 
 @app.post("/api/accounts/{account_id}/profile/reset", dependencies=[Depends(_admin_token)])

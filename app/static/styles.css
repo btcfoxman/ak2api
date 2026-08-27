@@ -142,6 +142,7 @@ dialog.settings-dialog {
 }
 dialog.cost-dialog { width: min(1060px, calc(100vw - 20px)); }
 dialog::backdrop { background: rgba(1, 4, 6, .78); backdrop-filter: blur(2px); }
+body:has(dialog[open]) { overflow: hidden; }
 .dialog-form { padding: 10px; overflow: auto; max-height: calc(100vh - 26px); }
 dialog header { justify-content: space-between; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
 dialog footer { justify-content: flex-end; padding-top: 9px; }
@@ -162,6 +163,12 @@ textarea { resize: vertical; }
 .profile-reset-grid { grid-template-columns: 1fr; }
 .reset-warning { display: flex; align-items: flex-start; gap: 7px; margin-top: 8px; padding: 7px 8px; border-left: 2px solid #9b7434; background: #1d1911; color: #d9c798; font-size: 9px; line-height: 1.45; }
 .reset-warning svg { flex: none; margin-top: 1px; }
+.batch-result {
+  margin-top: 8px; padding: 7px 9px; border: 1px solid #347d68;
+  border-left: 2px solid var(--mint); background: rgba(31, 91, 72, .16);
+  color: #bed5ce; font: 9px/1.5 "Cascadia Mono", Consolas, monospace; white-space: pre-wrap;
+}
+.batch-result.error { border-color: #8f4d4b; border-left-color: var(--red); background: rgba(91, 31, 31, .16); color: #d8b9b8; }
 .editor-label { margin-top: 9px; }
 .json-editor { min-height: 180px; line-height: 1.45; tab-size: 2; }
 .kind-tabs { margin-top: 9px; }

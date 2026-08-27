@@ -81,7 +81,15 @@ class SettingsPatch(BaseModel):
     task_timeout_seconds: int | None = Field(default=None, ge=60, le=7200)
     request_timeout_seconds: int | None = Field(default=None, ge=10, le=600)
     request_retries: int | None = Field(default=None, ge=0, le=5)
+    account_maintenance_interval_seconds: int | None = Field(
+        default=None, ge=30, le=86400
+    )
+    account_maintenance_workers: int | None = Field(default=None, ge=1, le=20)
     browser_recovery_enabled: bool | None = None
+    browser_timeout_seconds: int | None = Field(default=None, ge=30, le=900)
+    browser_login_workers: int | None = Field(default=None, ge=1, le=10)
+    browser_login_stagger_seconds: float | None = Field(default=None, ge=0, le=60)
+    browser_challenge_grace_seconds: int | None = Field(default=None, ge=3, le=120)
     chrome_executable: str | None = None
     chrome_user_data_root: str | None = None
     chrome_headless: bool | None = None

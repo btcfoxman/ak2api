@@ -84,6 +84,8 @@ class Settings:
     browser_recovery_enabled: bool
     browser_timeout_seconds: int
     browser_login_workers: int
+    browser_login_stagger_seconds: float
+    browser_challenge_grace_seconds: int
     chrome_executable: str
     chrome_user_data_root: str
     chrome_cdp_base_port: int
@@ -134,6 +136,12 @@ def load_settings() -> Settings:
         browser_recovery_enabled=_env_bool("AK_BROWSER_RECOVERY_ENABLED", True),
         browser_timeout_seconds=_env_int("AK_BROWSER_TIMEOUT_SECONDS", 180, 30, 900),
         browser_login_workers=_env_int("AK_BROWSER_LOGIN_WORKERS", 2, 1, 10),
+        browser_login_stagger_seconds=_env_float(
+            "AK_BROWSER_LOGIN_STAGGER_SECONDS", 3, 0, 60
+        ),
+        browser_challenge_grace_seconds=_env_int(
+            "AK_BROWSER_CHALLENGE_GRACE_SECONDS", 12, 3, 120
+        ),
         chrome_executable=_env("AK_CHROME_EXECUTABLE", ""),
         chrome_user_data_root=_env(
             "AK_CHROME_USER_DATA_ROOT", "data/ak-chrome-profiles"

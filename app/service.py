@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 import threading
 import time
 import uuid
+from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable
 
 from app.browser_context import (
     AkoolBrowserChallengeError,
     AkoolBrowserError,
+    AkoolBrowserTransportError,
     delete_managed_profile,
     refresh_account_context,
     reset_managed_profile,
@@ -79,7 +82,13 @@ class AKService:
         "task_timeout_seconds",
         "request_timeout_seconds",
         "request_retries",
+        "account_maintenance_interval_seconds",
+        "account_maintenance_workers",
         "browser_recovery_enabled",
+        "browser_timeout_seconds",
+        "browser_login_workers",
+        "browser_login_stagger_seconds",
+        "browser_challenge_grace_seconds",
         "chrome_executable",
         "chrome_user_data_root",
         "chrome_headless",
@@ -97,21 +106,27 @@ class AKService:
         self.settings = settings
         self._load_runtime_settings()
         self._tasks = ThreadPoolExecutor(max_workers=50, thread_name_prefix="ak-task")
-        self._logins = ThreadPoolExecutor(
-            max_workers=int(settings.browser_login_workers),
-            thread_name_prefix="ak-login",
-        )
+        self._logins = ThreadPoolExecutor(max_workers=10, thread_name_prefix="ak-login")
         self._maintenance = ThreadPoolExecutor(
-            max_workers=int(settings.account_maintenance_workers),
+            max_workers=20,
             thread_name_prefix="ak-maintenance",
         )
         self._slots = _DynamicSlots(int(settings.task_workers))
+        self._login_slots = _DynamicSlots(int(settings.browser_login_workers))
+        self._maintenance_slots = _DynamicSlots(int(settings.account_maintenance_workers))
         self._futures: dict[str, Future[Any]] = {}
         self._future_lock = threading.RLock()
+        self._account_guard = threading.RLock()
+        self._running_logins: set[int] = set()
+        self._running_maintenance: set[int] = set()
+        self._resetting_profiles: set[int] = set()
         self._stop = threading.Event()
+        self._maintenance_wakeup = threading.Event()
         self._maintenance_thread: threading.Thread | None = None
 
     def start(self) -> None:
+        self._stop.clear()
+        self._maintenance_wakeup.clear()
         for task in self.db.recoverable_tasks():
             self._schedule(str(task["id"]))
         self._maintenance_thread = threading.Thread(
@@ -123,6 +138,7 @@ class AKService:
 
     def stop(self) -> None:
         self._stop.set()
+        self._maintenance_wakeup.set()
         if self._maintenance_thread:
             self._maintenance_thread.join(timeout=3)
         self._tasks.shutdown(wait=False, cancel_futures=False)
@@ -172,6 +188,15 @@ class AKService:
             persisted[field] = value
         self.db.set_settings(persisted)
         self._slots.set_limit(int(self.settings.task_workers))
+        self._login_slots.set_limit(int(self.settings.browser_login_workers))
+        self._maintenance_slots.set_limit(
+            int(self.settings.account_maintenance_workers)
+        )
+        if {
+            "account_maintenance_interval_seconds",
+            "account_maintenance_workers",
+        } & values.keys():
+            self._maintenance_wakeup.set()
         return self.runtime_settings()
 
     def models(self) -> list[dict[str, Any]]:
@@ -179,22 +204,79 @@ class AKService:
 
     def _proxy_values(self) -> list[str]:
         raw = str(self.settings.proxy_pool or "")
-        return [
-            normalize_proxy_url(item.strip())
-            for item in raw.replace(";", "\n").replace(",", "\n").splitlines()
-            if item.strip()
-        ]
+        values: list[str] = []
+        for item in raw.replace(";", "\n").replace(",", "\n").splitlines():
+            proxy = normalize_proxy_url(item.strip())
+            if proxy and proxy not in values:
+                values.append(proxy)
+        return values
 
-    def _assign_proxy(self) -> str:
+    def _assign_proxy(self, *, exclude_proxy: str = "") -> str:
         if not bool(self.settings.proxy_pool_enabled):
             return ""
-        proxies = self._proxy_values()
+        excluded = normalize_proxy_url(exclude_proxy)
+        proxies = [item for item in self._proxy_values() if item != excluded]
         if not proxies:
             return ""
         counts = self.db.proxy_assignment_counts()
         minimum = min(counts.get(proxy, 0) for proxy in proxies)
         candidates = [proxy for proxy in proxies if counts.get(proxy, 0) == minimum]
         return random.choice(candidates)
+
+    @staticmethod
+    def _identity_key(payload: dict[str, Any]) -> str:
+        return str(payload.get("email") or payload.get("name") or "").strip().lower()
+
+    @staticmethod
+    def _looks_like_proxy(value: str) -> bool:
+        return bool(
+            re.fullmatch(r"(?:\[[^]]+\]|[^\s:/]+):\d+", value)
+            or re.match(r"^(?:https?|socks4|socks5h?)://", value, re.IGNORECASE)
+        )
+
+    def _parse_batch_text(
+        self, text: str
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        accounts: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        for line_number, raw in enumerate(str(text or "").splitlines(), 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            for separator in ("\t", "----", "|", ","):
+                if separator in line:
+                    parts = [part.strip() for part in line.split(separator)]
+                    break
+            else:
+                parts = [line]
+            email = parts[0] if parts else ""
+            password = parts[1] if len(parts) > 1 else ""
+            proxy_url = parts[2] if len(parts) > 2 else ""
+            if len(parts) == 2 and self._looks_like_proxy(password):
+                proxy_url, password = password, ""
+            if not email:
+                errors.append({"line": str(line_number), "message": "email is required"})
+                continue
+            if len(parts) > 3:
+                errors.append(
+                    {
+                        "line": str(line_number),
+                        "message": "too many fields; expected email, password, proxy",
+                    }
+                )
+                continue
+            accounts.append(
+                {
+                    "name": email,
+                    "email": email,
+                    "password": password,
+                    "proxy_url": proxy_url,
+                    "enabled": True,
+                    "auto_login": True,
+                    "max_concurrency": int(self.settings.account_default_concurrency),
+                }
+            )
+        return accounts, errors
 
     @staticmethod
     def _account_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -217,10 +299,13 @@ class AKService:
 
     def upsert_account(self, payload: dict[str, Any], *, start_login: bool = False) -> dict[str, Any]:
         value = self._account_payload(payload)
-        if not str(value.get("proxy_url") or "").strip() and bool(value.pop("use_proxy_pool", True)):
-            value["proxy_url"] = self._assign_proxy()
-        account = self.db.upsert_account(value)
-        if start_login or (account.get("auto_login") and not account.get("cookie_header")):
+        with self._account_guard:
+            if not str(value.get("proxy_url") or "").strip() and bool(
+                value.pop("use_proxy_pool", True)
+            ):
+                value["proxy_url"] = self._assign_proxy()
+            account = self.db.upsert_account(value)
+        if start_login:
             self.schedule_login(int(account["id"]))
         return self.db.get_account(int(account["id"]), include_secrets=False) or account
 
@@ -233,39 +318,80 @@ class AKService:
         except Exception:
             return self.db.get_account(int(account["id"]), include_secrets=False) or account
 
-    def batch_import(self, text: str, *, start_login: bool, use_proxy_pool: bool) -> dict[str, Any]:
+    def batch_import(
+        self,
+        source: str | list[dict[str, Any]],
+        *,
+        start_login: bool,
+        use_proxy_pool: bool,
+    ) -> dict[str, Any]:
+        if isinstance(source, list):
+            raw_accounts = [self._account_payload(item) for item in source]
+            errors: list[dict[str, str]] = []
+        else:
+            raw_accounts, errors = self._parse_batch_text(source)
+        if not raw_accounts:
+            raise ValueError("no accounts were provided")
+        if len(raw_accounts) > 1000:
+            raise ValueError("at most 1000 accounts can be imported at once")
+
+        values: list[dict[str, Any]] = []
+        identity_indexes: dict[str, int] = {}
+        for item in raw_accounts:
+            identity = self._identity_key(item)
+            if not identity:
+                errors.append({"line": "", "message": "account name or email is required"})
+                continue
+            if identity in identity_indexes:
+                current = values[identity_indexes[identity]]
+                for key, value in item.items():
+                    if key in {"name", "email"}:
+                        continue
+                    if value not in (None, "", [], {}):
+                        current[key] = value
+                continue
+            identity_indexes[identity] = len(values)
+            values.append(dict(item))
+
+        pool = self._proxy_values() if use_proxy_pool and self.settings.proxy_pool_enabled else []
+        counts = Counter(self.db.proxy_assignment_counts())
+        existing_count = 0
+        for item in values:
+            explicit_proxy = normalize_proxy_url(str(item.get("proxy_url") or ""))
+            existing = self.db.find_account_by_identity(item, include_secrets=False)
+            if existing:
+                existing_count += 1
+                item["name"] = existing["name"]
+            if explicit_proxy:
+                item["proxy_url"] = explicit_proxy
+                if not existing:
+                    counts[explicit_proxy] += 1
+                continue
+            if existing:
+                continue
+            if pool:
+                selected = min(pool, key=lambda proxy: (counts[proxy], pool.index(proxy)))
+                item["proxy_url"] = selected
+                counts[selected] += 1
+
         accounts: list[dict[str, Any]] = []
-        duplicate_count = 0
-        errors: list[dict[str, str]] = []
-        for line_number, raw in enumerate(str(text or "").splitlines(), 1):
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            separator = "----" if "----" in line else "|"
-            parts = [part.strip() for part in line.split(separator)]
-            email = parts[0] if parts else ""
-            if not email:
-                continue
-            payload = {
-                "name": email,
-                "email": email,
-                "password": parts[1] if len(parts) > 1 else "",
-                "proxy_url": parts[2] if len(parts) > 2 else "",
-                "use_proxy_pool": use_proxy_pool,
-                "enabled": True,
-                "auto_login": True,
-            }
+        login_started_count = 0
+        for index, payload in enumerate(values, 1):
             try:
-                existing = self.db.find_account_by_identity(payload)
-                account = self.upsert_account(payload, start_login=start_login)
-                duplicate_count += 1 if existing else 0
+                account = self.upsert_account(payload, start_login=False)
                 accounts.append(account)
+                if start_login and self.schedule_login(int(account["id"])):
+                    login_started_count += 1
             except Exception as exc:
-                errors.append({"line": str(line_number), "message": str(exc)})
+                errors.append({"line": str(index), "message": str(exc)})
         return {
             "accounts": accounts,
             "count": len(accounts),
-            "duplicate_count": duplicate_count,
+            "input_count": len(raw_accounts),
+            "duplicate_count": len(raw_accounts) - len(values) + existing_count,
+            "existing_count": existing_count,
+            "login_started": bool(start_login),
+            "login_started_count": login_started_count,
             "errors": errors,
         }
 
@@ -292,8 +418,17 @@ class AKService:
         account = self.db.get_account(account_id)
         if not account:
             return False
+        if account.get("enabled"):
+            raise ValueError("account must be disabled before deletion")
         if int(account.get("active_tasks") or 0):
             raise ValueError("account has active tasks")
+        with self._account_guard:
+            if int(account_id) in self._running_logins:
+                raise ValueError("account login is in progress")
+            if int(account_id) in self._running_maintenance:
+                raise ValueError("account maintenance is in progress")
+            if int(account_id) in self._resetting_profiles:
+                raise ValueError("account profile reset is in progress")
         delete_managed_profile(account, self.settings)
         return self.db.delete_account(account_id)
 
@@ -305,50 +440,118 @@ class AKService:
         use_proxy_pool: bool,
         start_login: bool,
     ) -> dict[str, Any]:
-        account = self.db.get_account(account_id)
-        if not account:
-            raise KeyError("account not found")
-        if int(account.get("active_tasks") or 0):
-            raise ValueError("account has active tasks")
-        profile = reset_managed_profile(account, self.settings)
-        selected_proxy = str(proxy_url or "").strip()
-        if not selected_proxy and use_proxy_pool:
-            selected_proxy = self._assign_proxy()
-        updated = self.db.update_account(
-            account_id,
-            {
-                **profile,
-                "proxy_url": normalize_proxy_url(selected_proxy),
-                "access_token": "",
-                "user_id": "",
-                "team_id": "",
-                "cookie_header": "",
-                "cookie_records": [],
-                "status": "pending",
-                "last_error": "",
-            },
-        )
-        if start_login:
-            self.schedule_login(account_id)
-        return self.db.get_account(account_id, include_secrets=False) or updated or {}
+        account_id = int(account_id)
+        with self._account_guard:
+            account = self.db.get_account(account_id)
+            if not account:
+                raise KeyError("account not found")
+            if int(account.get("active_tasks") or 0):
+                raise ValueError("account has active tasks")
+            if account_id in self._running_logins:
+                raise ValueError("account login is already in progress")
+            if account_id in self._running_maintenance:
+                raise ValueError("account maintenance is already in progress")
+            if account_id in self._resetting_profiles:
+                raise ValueError("account profile reset is already in progress")
+            self._resetting_profiles.add(account_id)
+        previous_status = str(account.get("status") or "login_required")
+        self.db.update_account(account_id, {"status": "profile_resetting", "last_error": ""})
+        try:
+            current_proxy = normalize_proxy_url(str(account.get("proxy_url") or ""))
+            if use_proxy_pool:
+                selected_proxy = self._assign_proxy(exclude_proxy=current_proxy)
+                if not selected_proxy:
+                    raise ValueError("proxy pool is disabled, empty, or has no alternate proxy")
+            elif proxy_url is None:
+                selected_proxy = current_proxy
+            else:
+                selected_proxy = normalize_proxy_url(proxy_url)
+            profile = reset_managed_profile(account, self.settings)
+            updated = self.db.update_account(
+                account_id,
+                {
+                    **profile,
+                    "proxy_url": selected_proxy,
+                    "access_token": "",
+                    "user_id": "",
+                    "team_id": "",
+                    "cookie_header": "",
+                    "cookie_records": [],
+                    "user_agent": "",
+                    "sec_ch_ua": "",
+                    "sec_ch_ua_platform": "",
+                    "status": "login_pending" if start_login else "login_required",
+                    "last_error": "",
+                    "last_login_at": None,
+                },
+            )
+        except Exception as exc:
+            self.db.update_account(
+                account_id,
+                {"status": previous_status, "last_error": f"profile reset failed: {exc}"},
+            )
+            raise
+        finally:
+            with self._account_guard:
+                self._resetting_profiles.discard(account_id)
+        login_started = self.schedule_login(account_id) if start_login else False
+        return {
+            "account": self.db.get_account(account_id, include_secrets=False) or updated or {},
+            "profile_reset": profile,
+            "login_started": login_started,
+        }
 
-    def schedule_login(self, account_id: int) -> None:
-        self._logins.submit(self._login_account, int(account_id))
+    def schedule_login(self, account_id: int) -> bool:
+        account_id = int(account_id)
+        with self._account_guard:
+            if account_id in self._running_logins:
+                return False
+            if not self.db.get_account(account_id, include_secrets=False):
+                return False
+            self._running_logins.add(account_id)
+            self.db.update_account(account_id, {"status": "logging_in", "last_error": ""})
+            try:
+                future = self._logins.submit(self._login_account, account_id)
+            except Exception:
+                self._running_logins.discard(account_id)
+                raise
+        future.add_done_callback(lambda _future, value=account_id: self._finish_login(value))
+        return True
+
+    def _finish_login(self, account_id: int) -> None:
+        with self._account_guard:
+            self._running_logins.discard(int(account_id))
 
     def _login_account(self, account_id: int) -> dict[str, Any]:
-        account = self.db.get_account(account_id)
-        if not account:
-            raise KeyError("account not found")
+        self._login_slots.acquire()
         try:
+            stagger = float(self.settings.browser_login_stagger_seconds)
+            if stagger > 0:
+                time.sleep(random.uniform(0, stagger))
+            account = self.db.get_account(account_id)
+            if not account:
+                raise KeyError("account not found")
             context = refresh_account_context(account, self.settings)
             self.db.update_account(account_id, context)
             return self.check_account(account_id, recover=False)
-        except (AkoolBrowserChallengeError, AkoolBrowserError) as exc:
+        except Exception as exc:
+            if isinstance(exc, (AkoolBrowserChallengeError, AkoolRiskBlocked)):
+                status = "challenge_required"
+            elif isinstance(exc, AkoolBrowserTransportError):
+                status = "network_error"
+            elif isinstance(exc, AkoolAuthError):
+                status = "login_failed"
+            elif isinstance(exc, AkoolBrowserError):
+                status = "login_failed"
+            else:
+                status = "network_error"
             self.db.update_account(
                 account_id,
-                {"status": "login_required", "last_error": str(exc), "last_checked_at": now_ts()},
+                {"status": status, "last_error": str(exc), "last_checked_at": now_ts()},
             )
             raise
+        finally:
+            self._login_slots.release()
 
     def _recover_client(self, account: dict[str, Any]) -> AkoolClient:
         if not bool(self.settings.browser_recovery_enabled):
@@ -827,16 +1030,37 @@ class AKService:
         return str(items[index].get("value") or "")
 
     def _maintenance_loop(self) -> None:
-        while not self._stop.wait(int(self.settings.account_maintenance_interval_seconds)):
+        while not self._stop.is_set():
+            interrupted = self._maintenance_wakeup.wait(
+                int(self.settings.account_maintenance_interval_seconds)
+            )
+            self._maintenance_wakeup.clear()
+            if self._stop.is_set():
+                break
+            if interrupted:
+                continue
             for account in self.db.list_accounts(include_secrets=False):
                 if (
                     account.get("enabled")
                     and account.get("auto_login")
                     and not int(account.get("active_tasks") or 0)
                 ):
-                    self._maintenance.submit(self._maintenance_check, int(account["id"]))
+                    account_id = int(account["id"])
+                    with self._account_guard:
+                        if (
+                            account_id in self._running_logins
+                            or account_id in self._running_maintenance
+                            or account_id in self._resetting_profiles
+                        ):
+                            continue
+                        self._running_maintenance.add(account_id)
+                    future = self._maintenance.submit(self._maintenance_check, account_id)
+                    future.add_done_callback(
+                        lambda _future, value=account_id: self._finish_maintenance(value)
+                    )
 
     def _maintenance_check(self, account_id: int) -> None:
+        self._maintenance_slots.acquire()
         try:
             self.check_account(account_id, recover=False)
         except Exception as exc:
@@ -844,8 +1068,14 @@ class AKService:
             account = self.db.get_account(account_id, include_secrets=False) or {}
             if account.get("enabled") and account.get("auto_login") and account.get(
                 "status"
-            ) == "login_required":
+            ) in {"login_required", "network_error"}:
                 self.schedule_login(account_id)
+        finally:
+            self._maintenance_slots.release()
+
+    def _finish_maintenance(self, account_id: int) -> None:
+        with self._account_guard:
+            self._running_maintenance.discard(int(account_id))
 
     def status(self) -> dict[str, Any]:
         tasks = self.db.list_task_summaries(100)

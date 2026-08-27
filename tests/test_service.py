@@ -27,6 +27,8 @@ def settings(tmp_path) -> SimpleNamespace:
         browser_recovery_enabled=False,
         browser_timeout_seconds=30,
         browser_login_workers=1,
+        browser_login_stagger_seconds=0,
+        browser_challenge_grace_seconds=3,
         chrome_executable="",
         chrome_user_data_root=str(tmp_path / "profiles"),
         chrome_cdp_base_port=19800,
@@ -125,3 +127,94 @@ def test_task_uses_dynamic_fee_and_refreshes_balance(tmp_path, monkeypatch) -> N
     assert task["result_urls"] == ["https://cdn.example.com/result.mp4"]
     assert refreshed["last_balance"] == 96
     assert refreshed["active_tasks"] == 0
+
+
+def test_batch_import_supports_leo_formats_and_balances_proxy_pool(
+    tmp_path, monkeypatch
+) -> None:
+    runtime = settings(tmp_path)
+    runtime.proxy_pool_enabled = True
+    runtime.proxy_pool = "socks5://xray:20001\nsocks5://xray:20002"
+    db = Database(str(tmp_path / "batch.db"), default_concurrency=8)
+    gateway = AKService(db, runtime)
+    started: list[int] = []
+    monkeypatch.setattr(
+        gateway,
+        "schedule_login",
+        lambda account_id: not started.append(int(account_id)),
+    )
+
+    try:
+        result = gateway.batch_import(
+            "\n".join(
+                (
+                    "one@example.com|password-one",
+                    "two@example.com----password-two----socks5://xray:20009",
+                    "three@example.com,password-three",
+                    "one@example.com\tupdated-password\tsocks5://xray:20008",
+                )
+            ),
+            start_login=True,
+            use_proxy_pool=True,
+        )
+    finally:
+        gateway.stop()
+
+    assert result["input_count"] == 4
+    assert result["count"] == 3
+    assert result["duplicate_count"] == 1
+    assert result["login_started_count"] == 3
+    assert len(started) == 3
+    accounts = {item["email"]: item for item in db.list_accounts(include_secrets=True)}
+    assert accounts["one@example.com"]["password"] == "updated-password"
+    assert accounts["one@example.com"]["proxy_url"] == "socks5://xray:20008"
+    assert accounts["two@example.com"]["proxy_url"] == "socks5://xray:20009"
+    assert accounts["three@example.com"]["proxy_url"] in {
+        "socks5://xray:20001",
+        "socks5://xray:20002",
+    }
+
+
+def test_batch_import_can_store_without_starting_login(tmp_path, monkeypatch) -> None:
+    db = Database(str(tmp_path / "no-login.db"), default_concurrency=8)
+    gateway = AKService(db, settings(tmp_path))
+    monkeypatch.setattr(
+        gateway,
+        "schedule_login",
+        lambda _account_id: (_ for _ in ()).throw(AssertionError("login was scheduled")),
+    )
+    try:
+        result = gateway.batch_import(
+            "proxy-only@example.com|xray:20001",
+            start_login=False,
+            use_proxy_pool=False,
+        )
+    finally:
+        gateway.stop()
+
+    assert result["login_started_count"] == 0
+    account = db.list_accounts(include_secrets=True)[0]
+    assert account["password"] == ""
+    assert account["proxy_url"] == "socks5://xray:20001"
+
+
+def test_runtime_login_limits_update_immediately(tmp_path) -> None:
+    db = Database(str(tmp_path / "settings.db"), default_concurrency=8)
+    gateway = AKService(db, settings(tmp_path))
+    try:
+        changed = gateway.update_runtime_settings(
+            {
+                "browser_login_workers": 4,
+                "browser_login_stagger_seconds": 1.5,
+                "browser_challenge_grace_seconds": 20,
+                "account_maintenance_workers": 5,
+            }
+        )
+    finally:
+        gateway.stop()
+
+    assert changed["browser_login_workers"] == 4
+    assert changed["browser_login_stagger_seconds"] == 1.5
+    assert changed["browser_challenge_grace_seconds"] == 20
+    assert gateway._login_slots.limit == 4
+    assert gateway._maintenance_slots.limit == 5
