@@ -109,28 +109,6 @@ jobs:
           test "$env_checksum" = "$(sha256sum .env | awk '{print $1}')"
           test "$compose_checksum" = "$(sha256sum docker-compose.yml | awk '{print $1}')"
 
-      - name: Verify browser and proxy runtime
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          docker exec -i ak2api python - <<'PY'
-          import os
-          import socket
-
-          assert os.environ["AK_CHROME_EXECUTABLE"] == "/usr/bin/chromium"
-          assert os.environ["AK_CHROME_USER_DATA_ROOT"] == "/app/data/ak-chrome-profiles"
-          assert os.environ["AK_PROXY_HOST_OVERRIDE"] == "host.docker.internal"
-          assert os.environ["AK_CHROME_CDP_BASE_PORT"] == "19800"
-
-          proxies = [value.strip() for value in os.environ["AK_PROXY_POOL"].replace(";", ",").split(",") if value.strip()]
-          assert proxies, "AK_PROXY_POOL must contain at least one proxy"
-          for value in proxies:
-              host, port = value.removeprefix("socks5://").rsplit(":", 1)
-              with socket.create_connection((host, int(port)), timeout=2):
-                  pass
-          PY
-
       - name: Verify container status
         shell: bash
         run: |
@@ -151,6 +129,34 @@ jobs:
           docker ps -a --filter name=ak2api
           docker logs --tail 120 ak2api || true
           exit 1
+
+      - name: Verify browser and proxy runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker exec -i ak2api python - <<'PY'
+          import os
+          import socket
+
+          assert os.environ["AK_CHROME_EXECUTABLE"] == "/usr/bin/chromium"
+          assert os.environ["AK_CHROME_USER_DATA_ROOT"] == "/app/data/ak-chrome-profiles"
+          assert os.environ["AK_PROXY_HOST_OVERRIDE"] == "host.docker.internal"
+          assert os.environ["AK_CHROME_CDP_BASE_PORT"] == "19800"
+
+          proxies = [value.strip() for value in os.environ["AK_PROXY_POOL"].replace(";", ",").split(",") if value.strip()]
+          assert proxies, "AK_PROXY_POOL must contain at least one proxy"
+          failures = []
+          for value in proxies:
+              host, port = value.removeprefix("socks5://").rsplit(":", 1)
+              try:
+                  with socket.create_connection((host, int(port)), timeout=2):
+                      pass
+              except OSError:
+                  failures.append(value)
+          if failures:
+              raise SystemExit(f"configured proxies are unreachable: {', '.join(failures)}")
+          PY
 
       - name: Configure cloudflared ingress
         shell: bash
