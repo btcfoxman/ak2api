@@ -82,6 +82,7 @@ def settings(tmp_path) -> SimpleNamespace:
         proxy_pool="",
         low_balance_disable_threshold=1,
         excess_media_policy="ignore",
+        allow_video_reference_inputs=True,
         prompt_media_reference_cleanup_enabled=False,
         model_map=json.dumps(
             {"seedance-mini": "doubao-seedance-2-0-mini-260615"}
@@ -538,3 +539,41 @@ def test_runtime_login_limits_update_immediately(tmp_path) -> None:
     assert changed["browser_challenge_grace_seconds"] == 20
     assert gateway._login_slots.limit == 4
     assert gateway._maintenance_slots.limit == 5
+
+
+def test_video_reference_input_setting_rejects_new_tasks_and_updates_models(
+    tmp_path,
+) -> None:
+    runtime = settings(tmp_path)
+    runtime.allow_video_reference_inputs = False
+    db = Database(str(tmp_path / "video-input-setting.db"), default_concurrency=8)
+    gateway = AKService(db, runtime)
+
+    try:
+        models = gateway.models()
+        assert models
+        assert all(
+            model["capabilities"]["media_limits"]["videos"] == 0
+            for model in models
+        )
+        assert gateway.runtime_settings()["media_limits"]["videos"] == 0
+        with pytest.raises(ValueError, match="video reference inputs are disabled"):
+            gateway.create_task(
+                {
+                    "model": "doubao-seedance-2-0-mini-260615",
+                    "prompt": "test",
+                    "duration": 4,
+                    "resolution": "480p",
+                    "aspect_ratio": "adaptive",
+                    "video_urls": ["https://example.com/reference.mp4"],
+                }
+            )
+        assert db.active_task_count() == 0
+
+        updated = gateway.update_runtime_settings(
+            {"allow_video_reference_inputs": True}
+        )
+        assert updated["allow_video_reference_inputs"] is True
+        assert gateway.models()[0]["capabilities"]["media_limits"]["videos"] > 0
+    finally:
+        gateway.stop()

@@ -127,6 +127,7 @@ class AKService:
         "proxy_pool",
         "low_balance_disable_threshold",
         "excess_media_policy",
+        "allow_video_reference_inputs",
         "prompt_media_reference_cleanup_enabled",
         "model_map",
     )
@@ -197,6 +198,8 @@ class AKService:
         value = {field: getattr(self.settings, field) for field in self.runtime_fields}
         value["ignore_excess_media"] = value["excess_media_policy"] == "ignore"
         value["media_limits"] = dict(MEDIA_LIMITS)
+        if not bool(value["allow_video_reference_inputs"]):
+            value["media_limits"]["videos"] = 0
         return value
 
     def update_runtime_settings(self, changes: dict[str, Any]) -> dict[str, Any]:
@@ -231,7 +234,14 @@ class AKService:
         return self.runtime_settings()
 
     def models(self) -> list[dict[str, Any]]:
-        return public_models(self.settings.model_map)
+        models = public_models(self.settings.model_map)
+        if bool(self.settings.allow_video_reference_inputs):
+            return models
+        for model in models:
+            capabilities = model.get("capabilities") or {}
+            limits = capabilities.get("media_limits") or {}
+            limits["videos"] = 0
+        return models
 
     def _proxy_values(self) -> list[str]:
         raw = str(self.settings.proxy_pool or "")
@@ -664,6 +674,13 @@ class AKService:
                 self.settings.excess_media_policy,
                 bool(self.settings.prompt_media_reference_cleanup_enabled),
             )
+            if (
+                normalized.get("_videos")
+                and not bool(self.settings.allow_video_reference_inputs)
+            ):
+                raise ValueError(
+                    "video reference inputs are disabled by the channel setting"
+                )
             normalized["_requested_model"] = str(
                 payload.get("model") or "doubao-seedance-2-0-mini-260615"
             )

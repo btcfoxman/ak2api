@@ -95,6 +95,7 @@ class Settings:
     proxy_pool: str
     low_balance_disable_threshold: float
     excess_media_policy: str
+    allow_video_reference_inputs: bool
     prompt_media_reference_cleanup_enabled: bool
     model_map: str
     schema_version: str
@@ -155,6 +156,9 @@ def load_settings() -> Settings:
             "AK_LOW_BALANCE_DISABLE_THRESHOLD", 1, 0, 1_000_000_000
         ),
         excess_media_policy=_env("AK_EXCESS_MEDIA_POLICY", "ignore").lower(),
+        allow_video_reference_inputs=_env_bool(
+            "AK_ALLOW_VIDEO_REFERENCE_INPUTS", True
+        ),
         prompt_media_reference_cleanup_enabled=_env_bool(
             "AK_PROMPT_MEDIA_REFERENCE_CLEANUP_ENABLED", False
         ),

@@ -98,6 +98,7 @@ class SettingsPatch(BaseModel):
     proxy_pool: str | None = None
     low_balance_disable_threshold: float | None = Field(default=None, ge=0)
     excess_media_policy: Literal["ignore", "strict"] | None = None
+    allow_video_reference_inputs: bool | None = None
     prompt_media_reference_cleanup_enabled: bool | None = None
     model_map: str | None = Field(default=None, max_length=20000)
 

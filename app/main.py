@@ -25,7 +25,6 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.db import Database
-from app.model_catalog import MEDIA_LIMITS
 from app.schemas import (
     AccountPatch,
     AccountProfileReset,
@@ -384,7 +383,8 @@ def task_media(task_id: str, index: int) -> Response:
 @app.get("/api/integration-docs", dependencies=[Depends(_admin_token)])
 def integration_docs() -> Response:
     model_lines: list[str] = []
-    for model in service.models():
+    models = service.models()
+    for model in models:
         capabilities = model.get("capabilities") or {}
         limits = capabilities.get("media_limits") or {}
         model_lines.append(
@@ -395,13 +395,40 @@ def integration_docs() -> Response:
             f"{limits.get('audio', 0)} 音频"
         )
     models_markdown = "\n".join(model_lines)
+    channel_limits = {
+        kind: max(
+            (
+                int(((model.get("capabilities") or {}).get("media_limits") or {}).get(kind) or 0)
+                for model in models
+            ),
+            default=0,
+        )
+        for kind in ("images", "videos", "audio")
+    }
+    video_inputs_enabled = bool(settings.allow_video_reference_inputs)
+    prompt_example = (
+        "参考 @图片1、@视频1、@音频1、@音频2 和 @音频3，保持主体一致"
+        if video_inputs_enabled
+        else "参考 @图片1、@音频1、@音频2 和 @音频3，保持主体一致"
+    )
+    video_example = (
+        '  "video_urls": ["https://example.com/1.mp4"],\n'
+        if video_inputs_enabled
+        else ""
+    )
+    video_policy = (
+        "允许输入视频参考素材"
+        if video_inputs_enabled
+        else "视频参考素材已由运行设置禁用；携带视频素材将返回 422"
+    )
     text = f"""# AK2API 调用说明
 
 ## 能力
 
 - 已接入模型：
 {models_markdown}
-- 渠道最大素材上限：{MEDIA_LIMITS['images']} 图、{MEDIA_LIMITS['videos']} 视频、{MEDIA_LIMITS['audio']} 音频；各模型按上表限制
+- 渠道最大素材上限：{channel_limits['images']} 图、{channel_limits['videos']} 视频、{channel_limits['audio']} 音频；各模型按上表限制
+- 视频参考策略：{video_policy}
 - 默认策略：超出素材数量时忽略多余项；设置中可切换为严格校验
 - 登录与任务协议始终使用账号绑定代理；提交前动态询价并预扣可用积分
 
@@ -416,13 +443,12 @@ Content-Type: application/json
 ```json
 {{
   "model": "doubao-seedance-2-0-mini-260615",
-  "prompt": "参考 @图片1、@视频1、@音频1、@音频2 和 @音频3，保持主体一致",
+  "prompt": "{prompt_example}",
   "duration": 4,
   "resolution": "720p",
   "aspect_ratio": "16:9",
   "image_urls": ["https://example.com/1.png"],
-  "video_urls": ["https://example.com/1.mp4"],
-  "audio_urls": [
+{video_example}  "audio_urls": [
     "https://example.com/1.mp3",
     "https://example.com/2.mp3",
     "https://example.com/3.mp3"
