@@ -219,6 +219,33 @@ def test_task_uses_dynamic_fee_and_refreshes_balance(tmp_path, monkeypatch) -> N
     assert refreshed["active_tasks"] == 0
 
 
+def test_account_acquisition_fails_fast_when_all_balances_are_too_low(
+    tmp_path,
+) -> None:
+    db = Database(str(tmp_path / "insufficient.db"), default_concurrency=8)
+    db.upsert_account(
+        {"name": "low", "status": "active", "last_balance": 120}
+    )
+    payload = {
+        "kind": "video",
+        "model": "doubao-seedance-2-0-260128",
+        "prompt": "test",
+        "duration": 15,
+        "resolution": "720p",
+        "_estimated_cost": 159,
+    }
+    task = db.create_task("gen_insufficient", payload)
+    gateway = AKService(db, settings(tmp_path))
+
+    try:
+        with pytest.raises(AkoolUpstreamError) as raised:
+            gateway._acquire_task_account(task, time.monotonic() + 10)
+    finally:
+        gateway.stop()
+
+    assert raised.value.code == "INSUFFICIENT_CREDITS"
+
+
 def test_dynamic_fee_shortfall_switches_from_preferred_account(
     tmp_path, monkeypatch
 ) -> None:

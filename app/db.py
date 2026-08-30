@@ -741,22 +741,49 @@ class Database:
             )
         return cursor.rowcount > 0
 
-    def available_account_count(self, exclude_ids: set[int] | None = None) -> int:
+    def available_account_count(
+        self,
+        exclude_ids: set[int] | None = None,
+        *,
+        minimum_balance: float = 0,
+    ) -> int:
         excluded = sorted({int(value) for value in (exclude_ids or set())})
         excluded_clause = ""
         parameters: list[Any] = []
         if excluded:
             placeholders = ", ".join("?" for _ in excluded)
-            excluded_clause = f"AND id NOT IN ({placeholders})"
+            excluded_clause = f"AND candidate.id NOT IN ({placeholders})"
             parameters.extend(excluded)
+        balance_clause = ""
+        minimum_balance = max(float(minimum_balance or 0), 0)
+        if minimum_balance > 0:
+            balance_clause = "AND candidate.available_balance >= ?"
+            parameters.append(minimum_balance)
         with self.connect() as connection:
             row = connection.execute(
                 f"""
+                WITH candidates AS (
+                    SELECT
+                        account.id,
+                        account.enabled,
+                        account.status,
+                        CASE
+                            WHEN account.last_balance IS NULL THEN NULL
+                            ELSE account.last_balance - COALESCE((
+                                SELECT SUM(task.reserved_cost)
+                                FROM tasks AS task
+                                WHERE task.account_id = account.id
+                                  AND task.reserved_cost > 0
+                            ), 0)
+                        END AS available_balance
+                    FROM accounts AS account
+                )
                 SELECT COUNT(*) AS count
-                FROM accounts
-                WHERE enabled = 1
-                  AND status IN ('active', 'pending')
+                FROM candidates AS candidate
+                WHERE candidate.enabled = 1
+                  AND candidate.status IN ('active', 'pending')
                   {excluded_clause}
+                  {balance_clause}
                 """,
                 parameters,
             ).fetchone()

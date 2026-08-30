@@ -731,6 +731,15 @@ class AKService:
                     code="NO_AVAILABLE_ACCOUNT",
                     status_code=503,
                 )
+            if reservation > 0 and self.db.available_account_count(
+                exclude_ids,
+                minimum_balance=reservation,
+            ) <= 0:
+                raise AkoolUpstreamError(
+                    "no active Akool account has enough available credit for this task",
+                    code="INSUFFICIENT_CREDITS",
+                    status_code=409,
+                )
             time.sleep(1)
         raise TimeoutError("timed out waiting for an available Akool account")
 

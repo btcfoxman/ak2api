@@ -47,6 +47,23 @@ def test_available_account_count_excludes_attempted_accounts(tmp_path) -> None:
     assert db.available_account_count({first["id"], second["id"]}) == 0
 
 
+def test_available_account_count_applies_balance_reservations(tmp_path) -> None:
+    db = Database(str(tmp_path / "funded-count.db"), default_concurrency=8)
+    account = db.upsert_account(
+        {"name": "funded", "status": "active", "last_balance": 200}
+    )
+    payload = {"kind": "video", "model": "test", "prompt": "test"}
+    db.create_task("reserved", payload)
+    assert db.acquire_account(
+        preferred_id=account["id"],
+        task_id="reserved",
+        reservation_cost=60,
+    )
+
+    assert db.available_account_count(minimum_balance=140) == 1
+    assert db.available_account_count(minimum_balance=141) == 0
+
+
 def test_account_dispatch_spreads_active_tasks_before_reusing_account(tmp_path) -> None:
     db = Database(str(tmp_path / "spread.db"), default_concurrency=8)
     accounts = [
