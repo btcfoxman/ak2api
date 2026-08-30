@@ -46,7 +46,7 @@ def test_prepare_image_crops_and_upscales_unsupported_tall_input() -> None:
     )
 
     with Image.open(io.BytesIO(data)) as prepared:
-        assert prepared.size == (120, 300)
+        assert prepared.size == (124, 301)
     assert content_type == "image/jpeg"
     assert filename == "image-1-akool.jpg"
     assert info["operations"] == [
@@ -64,7 +64,7 @@ def test_prepare_image_crops_overly_wide_input() -> None:
     )
 
     with Image.open(io.BytesIO(data)) as prepared:
-        assert prepared.size == (1250, 500)
+        assert prepared.size == (1245, 500)
     assert info["operations"] == ["center_crop_max_aspect"]
 
 

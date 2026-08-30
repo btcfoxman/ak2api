@@ -53,12 +53,10 @@ def _is_moderation_failure(message: Any) -> bool:
 
 def _is_image_constraint_failure(message: Any) -> bool:
     value = str(message or "").lower()
-    return any(
-        marker in value
-        for marker in (
-            "height must be between 300px and 6000px",
-            "aspect ratio must be between 0.4 and 2.5",
-        )
+    return (
+        "height" in value and "300" in value and "6000" in value
+    ) or (
+        "aspect ratio" in value and "0.4" in value and "2.5" in value
     )
 
 

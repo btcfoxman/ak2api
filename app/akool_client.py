@@ -26,10 +26,10 @@ PROFILE_PATH = "/interface/content-api/api/v7/content/profile/create"
 FEE_PATH = "/interface/content-api/api/v7/content/calculateFee"
 SUBMIT_PATH = "/interface/content-api/api/v7/content/image2Video/createBySourcePrompt/batch"
 LIST_PATH = "/interface/content-api/api/v6/content/resourceResult/list"
-IMAGE_MIN_HEIGHT = 300
-IMAGE_MAX_HEIGHT = 6000
-IMAGE_MIN_ASPECT_RATIO = 0.4
-IMAGE_MAX_ASPECT_RATIO = 2.5
+IMAGE_MIN_HEIGHT = 301
+IMAGE_MAX_HEIGHT = 5999
+IMAGE_MIN_ASPECT_RATIO = 0.41
+IMAGE_MAX_ASPECT_RATIO = 2.49
 
 
 class AkoolUpstreamError(RuntimeError):

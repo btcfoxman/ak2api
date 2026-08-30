@@ -41,6 +41,18 @@ def test_dynamic_slots_release_waiters_in_reserved_fifo_order() -> None:
     assert order == [2, 3]
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Height must be between 300px and 6000px.",
+        "Image height must be greater than 300 and less than 6000 pixels",
+        "Aspect ratio must be between 0.4 and 2.5.",
+    ],
+)
+def test_image_constraint_failure_matches_upstream_variants(message) -> None:
+    assert service_module._is_image_constraint_failure(message)
+
+
 def settings(tmp_path) -> SimpleNamespace:
     return SimpleNamespace(
         task_workers=2,
