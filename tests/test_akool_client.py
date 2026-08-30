@@ -253,3 +253,26 @@ def test_result_url_prefers_captured_video_fields() -> None:
             "video": "https://cdn.example.com/result.mp4",
         }
     ) == ["https://cdn.example.com/result.mp4"]
+
+
+def test_generation_status_four_is_failed_with_upstream_reason(monkeypatch) -> None:
+    client = AkoolClient({"cookie_header": "token=test"}, settings())
+    body = {
+        "code": 1000,
+        "data": {
+            "result": [
+                {
+                    "_id": "resource-failed",
+                    "video_status": 4,
+                    "error_reason": "Request failed. Please check your network and try again.",
+                }
+            ]
+        },
+    }
+    monkeypatch.setattr(client, "_request", lambda *args, **kwargs: (body, object()))
+
+    detail = client.generation_detail("resource-failed")
+
+    assert detail["status"] == "FAILED"
+    assert detail["providerStatus"] == 4
+    assert detail["error"] == "Request failed. Please check your network and try again."

@@ -45,3 +45,32 @@ def test_available_account_count_excludes_attempted_accounts(tmp_path) -> None:
     assert db.available_account_count() == 2
     assert db.available_account_count({first["id"]}) == 1
     assert db.available_account_count({first["id"], second["id"]}) == 0
+
+
+def test_account_dispatch_spreads_active_tasks_before_reusing_account(tmp_path) -> None:
+    db = Database(str(tmp_path / "spread.db"), default_concurrency=8)
+    accounts = [
+        db.upsert_account(
+            {
+                "name": f"account-{index}",
+                "status": "active",
+                "last_balance": 100 + index * 100,
+                "max_concurrency": 8,
+            }
+        )
+        for index in range(3)
+    ]
+    payload = {"kind": "video", "model": "test", "prompt": "test"}
+    for index in range(4):
+        db.create_task(f"task-{index}", payload)
+
+    selected = [
+        db.acquire_account(task_id=f"task-{index}", reservation_cost=0)
+        for index in range(4)
+    ]
+
+    assert [item["id"] for item in selected[:3] if item] == [
+        account["id"] for account in accounts
+    ]
+    assert selected[3] is not None
+    assert selected[3]["id"] == accounts[0]["id"]

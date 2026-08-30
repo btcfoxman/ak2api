@@ -1,13 +1,44 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from types import SimpleNamespace
 
 import app.service as service_module
 import pytest
 from app.akool_client import AkoolUpstreamError, MediaUpload
 from app.db import Database
-from app.service import AKService
+from app.service import AKService, _DynamicSlots
+
+
+def test_dynamic_slots_release_waiters_in_reserved_fifo_order() -> None:
+    slots = _DynamicSlots(1)
+    first = slots.reserve()
+    second = slots.reserve()
+    third = slots.reserve()
+    order: list[int] = []
+
+    slots.acquire(first)
+
+    def run(token: object, value: int) -> None:
+        slots.acquire(token)
+        order.append(value)
+        slots.release()
+
+    third_thread = threading.Thread(target=run, args=(third, 3))
+    second_thread = threading.Thread(target=run, args=(second, 2))
+    third_thread.start()
+    time.sleep(0.02)
+    second_thread.start()
+    time.sleep(0.02)
+    slots.release()
+    second_thread.join(timeout=1)
+    third_thread.join(timeout=1)
+
+    assert not second_thread.is_alive()
+    assert not third_thread.is_alive()
+    assert order == [2, 3]
 
 
 def settings(tmp_path) -> SimpleNamespace:

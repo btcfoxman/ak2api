@@ -6,7 +6,7 @@ import re
 import threading
 import time
 import uuid
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable
 
@@ -56,17 +56,38 @@ class _DynamicSlots:
         self.limit = max(int(limit), 1)
         self.active = 0
         self.condition = threading.Condition()
+        self.waiters: deque[object] = deque()
 
     def set_limit(self, limit: int) -> None:
         with self.condition:
             self.limit = max(int(limit), 1)
             self.condition.notify_all()
 
-    def acquire(self) -> None:
+    def reserve(self) -> object:
+        token = object()
         with self.condition:
-            while self.active >= self.limit:
+            self.waiters.append(token)
+            self.condition.notify_all()
+        return token
+
+    def cancel(self, token: object) -> None:
+        with self.condition:
+            try:
+                self.waiters.remove(token)
+            except ValueError:
+                return
+            self.condition.notify_all()
+
+    def acquire(self, token: object | None = None) -> None:
+        with self.condition:
+            if token is None:
+                token = object()
+                self.waiters.append(token)
+            while self.active >= self.limit or self.waiters[0] is not token:
                 self.condition.wait(1)
+            self.waiters.popleft()
             self.active += 1
+            self.condition.notify_all()
 
     def release(self) -> None:
         with self.condition:
@@ -116,6 +137,7 @@ class AKService:
         self._maintenance_slots = _DynamicSlots(int(settings.account_maintenance_workers))
         self._futures: dict[str, Future[Any]] = {}
         self._future_lock = threading.RLock()
+        self._task_submit_lock = threading.RLock()
         self._account_guard = threading.RLock()
         self._running_logins: set[int] = set()
         self._running_maintenance: set[int] = set()
@@ -618,39 +640,49 @@ class AKService:
             raise
 
     def create_task(self, payload: dict[str, Any], *, caller_request: dict[str, Any] | None = None) -> dict[str, Any]:
-        capacity = max(int(self.settings.task_queue_capacity), 0)
-        maximum_active = int(self.settings.task_workers) + capacity
-        if self.db.active_task_count() >= maximum_active:
-            raise AkoolUpstreamError(
-                "Akool task queue is full",
-                code="TASK_QUEUE_FULL",
-                status_code=429,
+        with self._task_submit_lock:
+            capacity = max(int(self.settings.task_queue_capacity), 0)
+            maximum_active = int(self.settings.task_workers) + capacity
+            if self.db.active_task_count() >= maximum_active:
+                raise AkoolUpstreamError(
+                    "Akool task queue is full",
+                    code="TASK_QUEUE_FULL",
+                    status_code=429,
+                )
+            normalized = normalize_generation_request(
+                payload,
+                self.settings.model_map,
+                self.settings.excess_media_policy,
+                bool(self.settings.prompt_media_reference_cleanup_enabled),
             )
-        normalized = normalize_generation_request(
-            payload,
-            self.settings.model_map,
-            self.settings.excess_media_policy,
-            bool(self.settings.prompt_media_reference_cleanup_enabled),
-        )
-        normalized["_requested_model"] = str(
-            payload.get("model") or "doubao-seedance-2-0-mini-260615"
-        )
-        normalized["_estimated_cost"] = self.db.estimate_cost(normalized)
-        task_id = f"gen_{uuid.uuid4().hex[:16]}"
-        task = self.db.create_task(task_id, normalized, caller_request=caller_request or payload)
-        self._schedule(task_id)
-        return task
+            normalized["_requested_model"] = str(
+                payload.get("model") or "doubao-seedance-2-0-mini-260615"
+            )
+            normalized["_estimated_cost"] = self.db.estimate_cost(normalized)
+            task_id = f"gen_{uuid.uuid4().hex[:16]}"
+            task = self.db.create_task(
+                task_id,
+                normalized,
+                caller_request=caller_request or payload,
+            )
+            self._schedule(task_id)
+            return task
 
     def _schedule(self, task_id: str) -> None:
         with self._future_lock:
             existing = self._futures.get(task_id)
             if existing and not existing.done():
                 return
-            future = self._tasks.submit(self._run_guarded, task_id)
+            slot_token = self._slots.reserve()
+            try:
+                future = self._tasks.submit(self._run_guarded, task_id, slot_token)
+            except Exception:
+                self._slots.cancel(slot_token)
+                raise
             self._futures[task_id] = future
 
-    def _run_guarded(self, task_id: str) -> None:
-        self._slots.acquire()
+    def _run_guarded(self, task_id: str, slot_token: object) -> None:
+        self._slots.acquire(slot_token)
         try:
             self._run_task(task_id)
         except Exception:

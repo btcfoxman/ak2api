@@ -134,7 +134,14 @@ def result_urls(detail: dict[str, Any]) -> list[str]:
 
 
 def failure_reason(detail: dict[str, Any]) -> str:
-    for key in ("error_message", "fail_msg", "error", "msg", "message"):
+    for key in (
+        "error_reason",
+        "error_message",
+        "fail_msg",
+        "error",
+        "msg",
+        "message",
+    ):
         value = detail.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -702,7 +709,10 @@ class AkoolClient:
                     status_value = int(item.get("video_status") or 0)
                     status = {1: "PENDING", 2: "PROCESSING", 3: "COMPLETE"}.get(
                         status_value,
-                        "FAILED" if failure_reason(item) != "Akool generation failed" else "PROCESSING",
+                        "FAILED"
+                        if status_value >= 4
+                        or failure_reason(item) != "Akool generation failed"
+                        else "PROCESSING",
                     )
                     progress = float(item.get("progress") or (100 if status == "COMPLETE" else 0))
                     return {

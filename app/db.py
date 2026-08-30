@@ -874,22 +874,15 @@ class Database:
                     )
                 )
                 ORDER BY
-                  CASE WHEN candidate.available_balance IS NULL THEN 1 ELSE 0 END ASC,
-                  candidate.available_balance ASC,
+                  candidate.active_tasks ASC,
+                  candidate.total_uses ASC,
                   CASE
-                    WHEN candidate.available_balance IS NULL THEN candidate.total_uses
-                    ELSE candidate.id
-                  END ASC,
-                  CASE
-                    WHEN candidate.available_balance IS NULL THEN candidate.active_tasks
-                    ELSE 0
-                  END ASC,
-                  CASE
-                    WHEN candidate.available_balance IS NULL
-                      AND candidate.last_used_at IS NOT NULL THEN 1
+                    WHEN candidate.last_used_at IS NOT NULL THEN 1
                     ELSE 0
                   END ASC,
                   candidate.last_used_at ASC,
+                  CASE WHEN candidate.available_balance IS NULL THEN 1 ELSE 0 END ASC,
+                  candidate.available_balance ASC,
                   candidate.id ASC
                 LIMIT 1
                 """,
@@ -1208,7 +1201,7 @@ class Database:
                 WHERE status IN (
                     'queued', 'preparing', 'submitted', 'running'
                 )
-                ORDER BY created_at ASC
+                ORDER BY created_at ASC, rowid ASC
                 """
             ).fetchall()
         return [
