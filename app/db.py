@@ -741,15 +741,24 @@ class Database:
             )
         return cursor.rowcount > 0
 
-    def available_account_count(self) -> int:
+    def available_account_count(self, exclude_ids: set[int] | None = None) -> int:
+        excluded = sorted({int(value) for value in (exclude_ids or set())})
+        excluded_clause = ""
+        parameters: list[Any] = []
+        if excluded:
+            placeholders = ", ".join("?" for _ in excluded)
+            excluded_clause = f"AND id NOT IN ({placeholders})"
+            parameters.extend(excluded)
         with self.connect() as connection:
             row = connection.execute(
-                """
+                f"""
                 SELECT COUNT(*) AS count
                 FROM accounts
                 WHERE enabled = 1
                   AND status IN ('active', 'pending')
-                """
+                  {excluded_clause}
+                """,
+                parameters,
             ).fetchone()
         return int(row["count"] or 0) if row else 0
 

@@ -671,6 +671,8 @@ class AKService:
         preferred = payload.get("account_id")
         if recovering and not preferred:
             preferred = task.get("account_id")
+        if preferred and exclude_ids and int(preferred) in exclude_ids:
+            preferred = None
         reservation = 0 if recovering else float(task.get("estimated_cost") or 0)
         while time.monotonic() < deadline:
             account = self.db.acquire_account(
@@ -684,21 +686,84 @@ class AKService:
             )
             if account:
                 return account
-            available = self.db.available_account_count()
+            available = self.db.available_account_count(exclude_ids)
             if available <= 0:
+                if exclude_ids:
+                    raise AkoolUpstreamError(
+                        "no remaining Akool account has enough credit for this task",
+                        code="INSUFFICIENT_CREDITS",
+                        status_code=409,
+                    )
                 raise AkoolUpstreamError(
                     "no active Akool account is available",
                     code="NO_AVAILABLE_ACCOUNT",
                     status_code=503,
                 )
-            if exclude_ids and len(exclude_ids) >= available:
-                raise AkoolUpstreamError(
-                    "no Akool account has enough available credit for this task",
-                    code="INSUFFICIENT_CREDITS",
-                    status_code=409,
-                )
             time.sleep(1)
         raise TimeoutError("timed out waiting for an available Akool account")
+
+    def _release_insufficient_credit_account(
+        self,
+        *,
+        task_id: str,
+        account: dict[str, Any],
+        client: AkoolClient,
+        error: AkoolUpstreamError,
+        phase: str,
+        attempts: list[dict[str, Any]],
+    ) -> None:
+        account_id = int(account["id"])
+        attempts.append(
+            {
+                f"{phase}_error": {
+                    "account_id": account_id,
+                    "code": error.code,
+                    "message": str(error),
+                    "response": error.details or {},
+                }
+            }
+        )
+        refreshed_balance = False
+        try:
+            self.db.update_task(
+                task_id,
+                upstream_response={"attempts": attempts[-30:]},
+                status="preparing",
+                progress=35,
+            )
+            try:
+                state, _ = self._with_recovery(
+                    account, client, lambda current: current.account_state()
+                )
+                self.db.update_account(
+                    account_id,
+                    {
+                        "last_balance": state.get("available_balance"),
+                        "balance_details": state.get("buckets") or {},
+                        "plan": state.get("plan") or "",
+                        "status": "active",
+                        "last_error": str(error),
+                        "last_checked_at": now_ts(),
+                    },
+                )
+                refreshed_balance = True
+            except Exception as refresh_exc:
+                self.db.update_account(
+                    account_id,
+                    {
+                        "last_error": (
+                            f"{error}; balance refresh failed: {refresh_exc}"
+                        ),
+                        "last_checked_at": now_ts(),
+                    },
+                )
+        finally:
+            self.db.release_account(account_id, task_id=task_id)
+        if refreshed_balance:
+            self.db.disable_account_for_low_balance_if_idle(
+                account_id,
+                float(self.settings.low_balance_disable_threshold),
+            )
 
     def _run_task(self, task_id: str) -> None:
         task = self.db.get_task(task_id)
@@ -769,13 +834,32 @@ class AKService:
                     self.db.update_task(task_id, progress=progress)
 
                 upstream_request = client.build_generation_request(payload, uploads)
-                fee_result, client = self._with_recovery(
-                    account,
-                    client,
-                    lambda current: current.calculate_fee(
-                        payload, uploads, upstream_request
-                    ),
-                )
+                try:
+                    fee_result, client = self._with_recovery(
+                        account,
+                        client,
+                        lambda current: current.calculate_fee(
+                            payload, uploads, upstream_request
+                        ),
+                    )
+                except AkoolUpstreamError as exc:
+                    if str(exc.code) != "INSUFFICIENT_CREDITS":
+                        raise
+                    self._release_insufficient_credit_account(
+                        task_id=task_id,
+                        account=account,
+                        client=client,
+                        error=exc,
+                        phase="calculate_fee",
+                        attempts=attempts,
+                    )
+                    excluded_ids.add(account_id)
+                    account = None
+                    client = None
+                    before_balance = None
+                    actual_cost = None
+                    balance_fresh = False
+                    continue
                 actual_cost = max(float(fee_result.get("fee") or 0), 0)
                 audit_request = {
                     "upload_endpoint": "POST /interface/storagesvc/api/v1/upload/signature -> PUT S3 -> POST /interface/content-api/api/v7/content/profile/create",
@@ -809,17 +893,31 @@ class AKService:
                     excluded_ids.add(account_id)
                     self.db.release_account(account_id, task_id=task_id)
                     account = None
-                    if payload.get("account_id"):
-                        raise AkoolUpstreamError(
-                            "the selected Akool account has insufficient available credit",
-                            code="INSUFFICIENT_CREDITS",
-                            status_code=409,
-                        )
+                    client = None
                     continue
 
-                generated, client = self._with_recovery(
-                    account, client, lambda current: current.generate(upstream_request)
-                )
+                try:
+                    generated, client = self._with_recovery(
+                        account, client, lambda current: current.generate(upstream_request)
+                    )
+                except AkoolUpstreamError as exc:
+                    if str(exc.code) != "INSUFFICIENT_CREDITS":
+                        raise
+                    self._release_insufficient_credit_account(
+                        task_id=task_id,
+                        account=account,
+                        client=client,
+                        error=exc,
+                        phase="generate",
+                        attempts=attempts,
+                    )
+                    excluded_ids.add(account_id)
+                    account = None
+                    client = None
+                    before_balance = None
+                    actual_cost = None
+                    balance_fresh = False
+                    continue
                 generated["fee"] = actual_cost
                 generation_id = str(generated["generationId"])
                 attempts.append({"generate": generated})

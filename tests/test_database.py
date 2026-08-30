@@ -34,3 +34,14 @@ def test_balance_reservation_prevents_oversubscription(tmp_path) -> None:
     assert db.acquire_account(task_id="one", reservation_cost=4, minimum_balance=4)
     assert db.acquire_account(task_id="two", reservation_cost=4, minimum_balance=4) is None
     assert db.estimate_cost(payload) == 0
+
+
+def test_available_account_count_excludes_attempted_accounts(tmp_path) -> None:
+    db = Database(str(tmp_path / "count.db"), default_concurrency=8)
+    first = db.upsert_account({"name": "first", "status": "active"})
+    second = db.upsert_account({"name": "second", "status": "active"})
+    db.upsert_account({"name": "disabled", "status": "disabled", "enabled": False})
+
+    assert db.available_account_count() == 2
+    assert db.available_account_count({first["id"]}) == 1
+    assert db.available_account_count({first["id"], second["id"]}) == 0

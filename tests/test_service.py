@@ -4,7 +4,8 @@ import json
 from types import SimpleNamespace
 
 import app.service as service_module
-from app.akool_client import MediaUpload
+import pytest
+from app.akool_client import AkoolUpstreamError, MediaUpload
 from app.db import Database
 from app.service import AKService
 
@@ -93,6 +94,64 @@ class FakeAkoolClient:
         }
 
 
+class InsufficientThenSuccessClient(FakeAkoolClient):
+    failure_account_id = 0
+    failure_phase = "generate"
+    generate_accounts: list[int] = []
+    upload_accounts: list[int] = []
+
+    def upload_media(self, source, kind, name=""):
+        account_id = int(self.account["id"])
+        self.upload_accounts.append(account_id)
+        return MediaUpload(
+            profile_id=f"profile-{account_id}-{kind}",
+            url=f"https://cdn.example.com/{account_id}/{kind}",
+            kind=kind,
+            name=name or kind,
+            content_type="application/octet-stream",
+            size=100,
+        )
+
+    @staticmethod
+    def raise_insufficient_credit() -> None:
+        body = {
+            "code": 1104,
+            "msg": "your credits is not enough",
+            "data": {"is_pop_upgrade": False, "sub_info": {}},
+        }
+        raise AkoolUpstreamError(
+            body["msg"],
+            code="INSUFFICIENT_CREDITS",
+            status_code=409,
+            details=body,
+        )
+
+    def calculate_fee(self, payload, uploads, request):
+        if (
+            self.failure_phase == "calculate_fee"
+            and int(self.account["id"]) == self.failure_account_id
+        ):
+            self.raise_insufficient_credit()
+        return super().calculate_fee(payload, uploads, request)
+
+    def generate(self, request):
+        account_id = int(self.account["id"])
+        self.generate_accounts.append(account_id)
+        if self.failure_phase == "generate" and account_id == self.failure_account_id:
+            self.raise_insufficient_credit()
+        return {"generationId": "resource-switched", "raw": {"code": 1000}}
+
+    def account_state(self):
+        account_id = int(self.account["id"])
+        balance = 0 if account_id == self.failure_account_id else 96
+        return {
+            "balance": balance,
+            "available_balance": balance,
+            "plan": "ProMax",
+            "buckets": {"credit": balance, "lock_credit": 0},
+        }
+
+
 def test_task_uses_dynamic_fee_and_refreshes_balance(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(service_module, "AkoolClient", FakeAkoolClient)
     db = Database(str(tmp_path / "test.db"), default_concurrency=8)
@@ -127,6 +186,107 @@ def test_task_uses_dynamic_fee_and_refreshes_balance(tmp_path, monkeypatch) -> N
     assert task["result_urls"] == ["https://cdn.example.com/result.mp4"]
     assert refreshed["last_balance"] == 96
     assert refreshed["active_tasks"] == 0
+
+
+def test_dynamic_fee_shortfall_switches_from_preferred_account(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(service_module, "AkoolClient", FakeAkoolClient)
+    db = Database(str(tmp_path / "fee-switch.db"), default_concurrency=8)
+    first = db.upsert_account(
+        {"name": "low", "status": "active", "last_balance": 2}
+    )
+    second = db.upsert_account(
+        {"name": "ready", "status": "active", "last_balance": 100}
+    )
+    payload = {
+        "kind": "video",
+        "model": "doubao-seedance-2-0-mini-260615",
+        "prompt": "test",
+        "duration": 4,
+        "resolution": "480p",
+        "aspect_ratio": "adaptive",
+        "account_id": first["id"],
+        "_images": [{"value": "https://example.com/image.png", "name": "image.png"}],
+        "_videos": [],
+        "_audio": [],
+        "_estimated_cost": 0,
+    }
+    db.create_task("gen_fee_switch", payload)
+    gateway = AKService(db, settings(tmp_path))
+
+    try:
+        gateway._run_task("gen_fee_switch")
+    finally:
+        gateway.stop()
+
+    task = db.get_task("gen_fee_switch")
+    assert task["status"] == "succeeded"
+    assert task["account_id"] == second["id"]
+    assert db.get_account(first["id"])["active_tasks"] == 0
+    assert db.get_account(second["id"])["active_tasks"] == 0
+
+
+@pytest.mark.parametrize("failure_phase", ["calculate_fee", "generate"])
+def test_upstream_insufficient_credit_reuploads_and_switches_account(
+    tmp_path, monkeypatch, failure_phase
+) -> None:
+    InsufficientThenSuccessClient.generate_accounts = []
+    InsufficientThenSuccessClient.upload_accounts = []
+    InsufficientThenSuccessClient.failure_phase = failure_phase
+    monkeypatch.setattr(
+        service_module, "AkoolClient", InsufficientThenSuccessClient
+    )
+    db = Database(str(tmp_path / "switch.db"), default_concurrency=8)
+    first = db.upsert_account(
+        {"name": "first", "status": "active", "last_balance": 100}
+    )
+    second = db.upsert_account(
+        {"name": "second", "status": "active", "last_balance": 100}
+    )
+    InsufficientThenSuccessClient.failure_account_id = int(first["id"])
+    payload = {
+        "kind": "video",
+        "model": "doubao-seedance-2-5",
+        "prompt": "test",
+        "duration": 4,
+        "resolution": "480p",
+        "aspect_ratio": "21:9",
+        "account_id": first["id"],
+        "_images": [{"value": "https://example.com/image.png", "name": "image.png"}],
+        "_videos": [{"value": "https://example.com/video.mp4", "name": "video.mp4"}],
+        "_audio": [],
+        "_estimated_cost": 0,
+    }
+    db.create_task("gen_switch", payload)
+    gateway = AKService(db, settings(tmp_path))
+
+    try:
+        gateway._run_task("gen_switch")
+    finally:
+        gateway.stop()
+
+    task = db.get_task("gen_switch")
+    first_after = db.get_account(first["id"])
+    second_after = db.get_account(second["id"])
+    assert task["status"] == "succeeded"
+    assert task["generation_id"] == "resource-switched"
+    assert task["account_id"] == second["id"]
+    assert InsufficientThenSuccessClient.generate_accounts == (
+        [first["id"], second["id"]]
+        if failure_phase == "generate"
+        else [second["id"]]
+    )
+    assert InsufficientThenSuccessClient.upload_accounts == [
+        first["id"],
+        first["id"],
+        second["id"],
+        second["id"],
+    ]
+    assert first_after["status"] == "disabled_low_balance"
+    assert first_after["active_tasks"] == 0
+    assert second_after["last_balance"] == 96
+    assert second_after["active_tasks"] == 0
 
 
 def test_batch_import_supports_leo_formats_and_balances_proxy_pool(

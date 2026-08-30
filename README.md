@@ -7,7 +7,7 @@ Akool 多素材视频生成协议网关。项目以真实 Chrome Profile + CDP �
 - 账号账密、Cookie、固定代理和独立浏览器 Profile 导入。
 - 批量格式支持 `email|password|proxy`、`email----password----proxy`、逗号和 Tab 分隔，也可向接口提交 JSON 账号数组。
 - 未指定代理时，从代理池按账号分配数量均衡绑定。
-- Seedance 2.0 Mini/Fast/标准、Seedance 2.5 Reference、Minimax H3。
+- Seedance 2.0 Mini/Fast/标准、Seedance 2.5 Reference、Wan 3.0、Minimax H3。
 - 图片、视频、音频 URL 或 data URL/base64 素材。
 - 提交前调用 Akool `calculateFee`，按 `credit - lock_credit` 预扣并发额度。
 - SQLite 任务恢复、账号并发、排队容量、低余额自动禁用。

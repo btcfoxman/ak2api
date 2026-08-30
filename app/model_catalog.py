@@ -43,6 +43,9 @@ class ModelSpec:
     all_in_one_reference: bool = True
     web_search: bool = False
     prompt_max_length: int = 20_000
+    audio_type: int = 1
+    include_generate_audio: bool = True
+    include_all_in_one_reference: bool = True
 
 
 MODEL_SPECS: dict[str, ModelSpec] = {
@@ -105,22 +108,39 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         max_audio_seconds=30,
         max_video_seconds=30,
     ),
+    "wan-3.0": ModelSpec(
+        id="wan-3.0",
+        label="Wan 3.0",
+        upstream_model="alibaba/wan-3.0/image-to-video",
+        provider="maas",
+        durations=tuple(range(4, 16)),
+        resolutions=("480P", "720P", "1080P"),
+        aspect_ratios=ASPECT_RATIOS,
+        max_images=9,
+        max_videos=3,
+        max_audio=3,
+        max_audio_seconds=15,
+        max_video_seconds=15,
+    ),
     "minimax-h3": ModelSpec(
         id="minimax-h3",
         label="Minimax H3",
-        upstream_model="minimax/h3/image-to-video",
+        upstream_model="minimax/h3/reference-to-video",
         provider="maas",
         durations=tuple(range(4, 16)),
         resolutions=("768P", "2k"),
         aspect_ratios=ASPECT_RATIOS,
-        max_images=2,
-        max_videos=0,
-        max_audio=0,
-        max_audio_seconds=0,
-        max_video_seconds=0,
+        max_images=9,
+        max_videos=3,
+        max_audio=3,
+        max_audio_seconds=15,
+        max_video_seconds=15,
         generate_audio=False,
         all_in_one_reference=False,
         prompt_max_length=7000,
+        audio_type=3,
+        include_generate_audio=False,
+        include_all_in_one_reference=False,
     ),
 }
 
@@ -129,12 +149,19 @@ DEFAULT_MODEL_MAP = {
     "seedance-2.0-mini": "doubao-seedance-2-0-mini-260615",
     "doubao-seedance-2-0-fast-260128": "doubao-seedance-2-0-fast-260128",
     "seedance-2.0-fast": "doubao-seedance-2-0-fast-260128",
+    "sd-2-0-fast": "doubao-seedance-2-0-fast-260128",
     "doubao-seedance-2-0-260128": "doubao-seedance-2-0-260128",
     "seedance-2.0": "doubao-seedance-2-0-260128",
+    "sd-2-0": "doubao-seedance-2-0-260128",
     "doubao-seedance-2-5": "doubao-seedance-2-5",
     "seedance-2.5": "doubao-seedance-2-5",
+    "wan-3.0": "wan-3.0",
+    "wan3.0": "wan-3.0",
+    "alibaba/wan-3.0": "wan-3.0",
+    "alibaba/wan-3.0/image-to-video": "wan-3.0",
     "minimax-h3": "minimax-h3",
     "minimax/h3": "minimax-h3",
+    "minimax/h3/reference-to-video": "minimax-h3",
 }
 
 MEDIA_LIMITS = {
@@ -260,11 +287,12 @@ def _normalize_resolution(value: Any, spec: ModelSpec) -> str:
     raw = str(value or spec.resolutions[0]).strip()
     key = raw.lower().replace("-", "_").replace(" ", "_")
     normalized = RESOLUTION_ALIASES.get(key, raw)
-    if normalized not in spec.resolutions:
-        raise ValueError(
-            f"{spec.id} resolution must be one of {', '.join(spec.resolutions)}"
-        )
-    return normalized
+    for supported in spec.resolutions:
+        if supported.lower() == normalized.lower():
+            return supported
+    raise ValueError(
+        f"{spec.id} resolution must be one of {', '.join(spec.resolutions)}"
+    )
 
 
 def _apply_media_limit(
@@ -343,6 +371,18 @@ def normalize_generation_request(
     if cleanup_prompt_references:
         prompt = re.sub(r"[ \t]{2,}", " ", _REFERENCE_PATTERN.sub("", prompt)).strip()
 
+    requested_generate_audio = payload.get("generate_audio")
+    generate_audio = spec.generate_audio and (
+        True if requested_generate_audio is None else bool(requested_generate_audio)
+    )
+    requested_web_search = payload.get("web_search")
+    web_search = spec.web_search and (
+        True if requested_web_search is None else bool(requested_web_search)
+    )
+    requested_all_in_one = payload.get("all_in_one_reference")
+    all_in_one_reference = spec.all_in_one_reference and (
+        True if requested_all_in_one is None else bool(requested_all_in_one)
+    )
     normalized = dict(payload)
     normalized.update(
         {
@@ -353,11 +393,9 @@ def normalize_generation_request(
             "duration": duration,
             "resolution": _normalize_resolution(payload.get("resolution"), spec),
             "aspect_ratio": ratio,
-            "generate_audio": bool(payload.get("generate_audio", spec.generate_audio)),
-            "web_search": bool(payload.get("web_search", spec.web_search)),
-            "all_in_one_reference": bool(
-                payload.get("all_in_one_reference", spec.all_in_one_reference)
-            ),
+            "generate_audio": generate_audio,
+            "web_search": web_search,
+            "all_in_one_reference": all_in_one_reference,
             "negative_prompt": str(
                 payload.get("negative_prompt") or payload.get("negativePrompt") or ""
             ).strip(),

@@ -11,4 +11,32 @@
 7. `GET /interface/content-api/api/v6/content/resourceResult/list` 按资源 `_id` 轮询，`video_status` 1/2/3 分别为提交、处理、完成。
 8. 完成结果优先读取 `external_video`，其次 `video`。
 
+含视频素材的全能参考请求必须同时携带 `prompt_info(type=video)`、提示词中的
+`{{video_profile_id}}` 引用和 `videoUrl`。`videoUrl` 在单视频时为字符串，多个
+视频时为数组；不要把任务结果中的 `reference_video_urls` 当作提交字段。
+Seedance 2.5 使用 `doubao/seedance-2-5/reference-to-video`，并携带
+`video_extend=false`、`all_in_one_reference=true`。其素材上限为 30 图、10 视频、
+10 音频，视频与音频累计时长分别不超过 30 秒。
+
+2026-08-30 的补充 CDP 记录确认：
+
+- Wan 3.0 使用 `alibaba/wan-3.0/image-to-video`，分辨率值保持为
+  `480P`、`720P`、`1080P`，提交包含 `audio_type=1`、
+  `all_in_one_reference=true` 和 `generate_audio=true`。
+- Minimax H3 使用 `minimax/h3/reference-to-video`，而不是
+  `minimax/h3/image-to-video`。分辨率为 `768P` 或 `2k`，提交包含
+  `audio_type=3`，不传 `generate_audio`、`all_in_one_reference`、`web_search`，
+  但图片、视频和参考音频仍通过 `imageUrl`、`videoUrl`、
+  `reference_audio_urls` 传递。
+- Seedance 2.0 即使包含视频素材，仍使用
+  `doubao-seedance-2-0-260128/image-to-video`；标准版和 Fast 版提交
+  `web_search=true`。
+- UI 的自适应画幅不会提交 `ratio` 字段；指定画幅时才提交实际比例。
+- `calculateFee` 中素材 ID 分别放入 `image_profile_ids` 与
+  `video_profile_ids`，没有对应素材时省略该字段。
+
+提交接口返回业务码 `1104`（`your credits is not enough`）时，当前账号的余额
+快照已不可信。任务会刷新该账号余额、释放并发槽位与预扣额度、排除该账号，
+随后在新账号下重新上传素材并再次询价、提交。
+
 SSE 在记录中出现 HTTP/2 协议错误，因此实现以资源列表轮询为准。提交接口 HTTP 200 仍需检查业务 `code == 1000` 和非空 `successList`。

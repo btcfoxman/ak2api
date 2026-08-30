@@ -122,7 +122,10 @@ class GenerationTaskCreate(BaseModel):
     duration: int = 4
     resolution: str = "480p"
     n: int = Field(default=1, ge=1, le=1)
-    generate_audio: bool = True
-    web_search: bool = True
+    generate_audio: bool | None = None
+    web_search: bool | None = None
+    extend_prompt: bool = True
+    video_extend: bool | None = None
+    all_in_one_reference: bool | None = None
     negative_prompt: str = ""
     account_id: int | None = None

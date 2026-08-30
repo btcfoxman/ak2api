@@ -285,7 +285,9 @@ class AkoolClient:
             raise AkoolAuthError(message)
         error_code = "PROVIDER_INVALID_REQUEST"
         status_code = 422
-        if any(value in message.lower() for value in ("credit", "balance", "insufficient")):
+        if code in (1104, "1104") or any(
+            value in message.lower() for value in ("credit", "balance", "insufficient")
+        ):
             error_code = "INSUFFICIENT_CREDITS"
             status_code = 409
         raise AkoolUpstreamError(
@@ -563,19 +565,23 @@ class AkoolClient:
                 code="PROVIDER_INVALID_REQUEST",
                 status_code=422,
             )
-        prompt_info, suffix = self._prompt_info(uploads)
+        video_info, video_references = self._prompt_info(videos)
+        other_info, other_references = self._prompt_info(images + audio)
+        prompt = str(payload.get("prompt") or "").strip()
+        if videos:
+            prompt = f"{video_references}\n\n{prompt}{other_references}"
+        else:
+            prompt = f"{prompt}{other_references}"
+        prompt_info = video_info + other_info
         upstream_model = str(payload.get("upstream_model") or spec.upstream_model)
-        if payload.get("model") == "doubao-seedance-2-0-260128" and videos:
-            upstream_model = "doubao-seedance-2-0-260128/video-to-video"
-        return {
-            "prompt": f"{str(payload.get('prompt') or '').strip()}{suffix}",
+        request = {
+            "prompt": prompt,
             "prompt_info": prompt_info,
             "negativePrompt": str(payload.get("negative_prompt") or ""),
             "extendPrompt": bool(payload.get("extend_prompt", True)),
-            "audio_type": 1,
+            "audio_type": spec.audio_type,
             "count": 1,
             "resolution": str(payload.get("resolution") or spec.resolutions[0]),
-            "ratio": str(payload.get("aspect_ratio") or "adaptive"),
             "modifiers": payload.get("modifiers")
             or [
                 {
@@ -586,13 +592,28 @@ class AkoolClient:
             ],
             "video_length": int(payload.get("duration") or spec.durations[0]),
             "imageUrl": [item.url for item in images],
-            "reference_video_urls": [item.url for item in videos],
             "reference_audio_urls": [item.url for item in audio],
-            "all_in_one_reference": bool(payload.get("all_in_one_reference", True)),
             "model_name": upstream_model,
-            "generate_audio": bool(payload.get("generate_audio", spec.generate_audio)),
-            "web_search": bool(payload.get("web_search", spec.web_search)),
         }
+        ratio = str(payload.get("aspect_ratio") or "adaptive")
+        if ratio != "adaptive":
+            request["ratio"] = ratio
+        if videos:
+            video_urls = [item.url for item in videos]
+            request["videoUrl"] = video_urls[0] if len(video_urls) == 1 else video_urls
+        if spec.include_all_in_one_reference:
+            request["all_in_one_reference"] = bool(
+                payload.get("all_in_one_reference", spec.all_in_one_reference)
+            )
+        if spec.include_generate_audio:
+            request["generate_audio"] = bool(
+                payload.get("generate_audio", spec.generate_audio)
+            )
+        if spec.id == "doubao-seedance-2-5":
+            request["video_extend"] = bool(payload.get("video_extend", False))
+        if bool(payload.get("web_search", spec.web_search)):
+            request["web_search"] = True
+        return request
 
     def calculate_fee(
         self,
@@ -600,6 +621,7 @@ class AkoolClient:
         uploads: list[MediaUpload],
         upstream_request: dict[str, Any],
     ) -> dict[str, Any]:
+        spec = model_spec(payload.get("model"))
         images = [item.profile_id for item in uploads if item.kind == "image"]
         videos = [item.profile_id for item in uploads if item.kind == "video"]
         request_body = {
@@ -608,14 +630,18 @@ class AkoolClient:
             "resolution": upstream_request["resolution"],
             "options": {
                 "duration": int(upstream_request["video_length"]),
-                "generate_audio": bool(upstream_request["generate_audio"]),
+                "generate_audio": bool(
+                    upstream_request.get("generate_audio", spec.generate_audio)
+                ),
                 "hasVideo": bool(videos),
-                "image_profile_ids": images,
-                "video_profile_ids": videos,
                 "is_canvas_workflow": False,
                 "is_unlimited_model": False,
             },
         }
+        if images:
+            request_body["options"]["image_profile_ids"] = images
+        if videos:
+            request_body["options"]["video_profile_ids"] = videos
         body, _ = self._request(
             "POST",
             FEE_PATH,
