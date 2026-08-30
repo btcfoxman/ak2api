@@ -183,6 +183,53 @@ class InsufficientThenSuccessClient(FakeAkoolClient):
         }
 
 
+class ImageConstraintThenSuccessClient(FakeAkoolClient):
+    force_flags: list[bool] = []
+    generation_count = 0
+
+    def upload_media(
+        self,
+        source,
+        kind,
+        name="",
+        *,
+        force_image_normalization=False,
+    ):
+        self.force_flags.append(bool(force_image_normalization))
+        return MediaUpload(
+            profile_id=f"profile-{kind}-{len(self.force_flags)}",
+            url=f"https://cdn.example.com/{kind}-{len(self.force_flags)}.jpg",
+            kind=kind,
+            name=name or kind,
+            content_type="image/jpeg",
+            size=100,
+            width=640,
+            height=480,
+        )
+
+    def generate(self, request):
+        self.__class__.generation_count += 1
+        return {
+            "generationId": f"resource-{self.generation_count}",
+            "raw": {"code": 1000},
+        }
+
+    def generation_detail(self, generation_id):
+        if generation_id == "resource-1":
+            return {
+                "generationId": generation_id,
+                "status": "FAILED",
+                "progress": 100,
+                "error": "Height must be between 300px and 6000px.",
+            }
+        return {
+            "generationId": generation_id,
+            "status": "COMPLETE",
+            "progress": 100,
+            "urls": ["https://cdn.example.com/repaired.mp4"],
+        }
+
+
 def test_task_uses_dynamic_fee_and_refreshes_balance(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(service_module, "AkoolClient", FakeAkoolClient)
     db = Database(str(tmp_path / "test.db"), default_concurrency=8)
@@ -244,6 +291,49 @@ def test_account_acquisition_fails_fast_when_all_balances_are_too_low(
         gateway.stop()
 
     assert raised.value.code == "INSUFFICIENT_CREDITS"
+
+
+def test_image_constraint_failure_reencodes_and_submits_once(
+    tmp_path, monkeypatch
+) -> None:
+    ImageConstraintThenSuccessClient.force_flags = []
+    ImageConstraintThenSuccessClient.generation_count = 0
+    monkeypatch.setattr(
+        service_module,
+        "AkoolClient",
+        ImageConstraintThenSuccessClient,
+    )
+    db = Database(str(tmp_path / "image-retry.db"), default_concurrency=8)
+    db.upsert_account(
+        {"name": "ready", "status": "active", "last_balance": 100}
+    )
+    payload = {
+        "kind": "video",
+        "model": "doubao-seedance-2-0-mini-260615",
+        "prompt": "test",
+        "duration": 4,
+        "resolution": "480p",
+        "aspect_ratio": "16:9",
+        "_images": [{"value": "https://example.com/image", "name": "image-1"}],
+        "_videos": [],
+        "_audio": [],
+        "_estimated_cost": 0,
+    }
+    db.create_task("gen_image_retry", payload)
+    gateway = AKService(db, settings(tmp_path))
+
+    try:
+        gateway._run_task("gen_image_retry")
+    finally:
+        gateway.stop()
+
+    task = db.get_task("gen_image_retry")
+    assert task["status"] == "succeeded"
+    assert task["generation_id"] == "resource-2"
+    assert task["result_urls"] == ["https://cdn.example.com/repaired.mp4"]
+    assert ImageConstraintThenSuccessClient.force_flags == [False, True]
+    attempts = (task["upstream_response"] or {}).get("attempts") or []
+    assert sum("image_constraint_retry" in item for item in attempts) == 1
 
 
 def test_dynamic_fee_shortfall_switches_from_preferred_account(

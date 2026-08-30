@@ -51,6 +51,17 @@ def _is_moderation_failure(message: Any) -> bool:
     return "content was flagged by our moderation system" in value
 
 
+def _is_image_constraint_failure(message: Any) -> bool:
+    value = str(message or "").lower()
+    return any(
+        marker in value
+        for marker in (
+            "height must be between 300px and 6000px",
+            "aspect ratio must be between 0.4 and 2.5",
+        )
+    )
+
+
 class _DynamicSlots:
     def __init__(self, limit: int):
         self.limit = max(int(limit), 1)
@@ -813,14 +824,30 @@ class AKService:
         deadline = time.monotonic() + int(self.settings.task_timeout_seconds)
         account: dict[str, Any] | None = None
         balance_fresh = False
-        actual_cost: float | None = None
-        attempts: list[dict[str, Any]] = []
+        stored_attempts = (task.get("upstream_response") or {}).get("attempts") or []
+        attempts: list[dict[str, Any]] = [
+            item for item in stored_attempts if isinstance(item, dict)
+        ][-30:]
         try:
             payload = task.get("request") or {}
             generation_id = str(task.get("generation_id") or "")
+            actual_cost: float | None = (
+                float(task.get("reserved_cost") or task.get("estimated_cost") or 0)
+                if generation_id
+                else None
+            )
             excluded_ids: set[int] = set()
             before_balance: float | None = None
             client: AkoolClient | None = None
+            image_constraint_retry = any(
+                "image_constraint_retry" in item for item in attempts
+            )
+            sources = (
+                [("image", item) for item in payload.get("_images") or []]
+                + [("video", item) for item in payload.get("_videos") or []]
+                + [("audio", item) for item in payload.get("_audio") or []]
+            )
+            uploads = []
 
             while account is None:
                 account = self._acquire_task_account(task, deadline, excluded_ids)
@@ -853,12 +880,6 @@ class AKService:
 
                 self.db.update_task(
                     task_id, status="preparing", progress=5, channel="akapi"
-                )
-                uploads = []
-                sources = (
-                    [("image", item) for item in payload.get("_images") or []]
-                    + [("video", item) for item in payload.get("_videos") or []]
-                    + [("audio", item) for item in payload.get("_audio") or []]
                 )
                 for index, (kind, item) in enumerate(sources):
                     upload, client = self._with_recovery(
@@ -1041,8 +1062,114 @@ class AKService:
                         )
                     return
                 if status == "FAILED":
+                    reason = failure_reason(detail)
+                    if (
+                        not image_constraint_retry
+                        and any(kind == "image" for kind, _ in sources)
+                        and _is_image_constraint_failure(reason)
+                    ):
+                        image_constraint_retry = True
+                        attempts.append(
+                            {
+                                "image_constraint_retry": {
+                                    "reason": reason,
+                                    "previous_generation_id": generation_id,
+                                }
+                            }
+                        )
+                        self.db.update_task(
+                            task_id,
+                            status="preparing",
+                            progress=10,
+                            upstream_response={"attempts": attempts[-30:]},
+                        )
+                        repaired_uploads = []
+                        for index, (kind, item) in enumerate(sources):
+                            existing = uploads[index] if index < len(uploads) else None
+                            if kind != "image" and existing is not None:
+                                repaired_uploads.append(existing)
+                                continue
+                            upload, client = self._with_recovery(
+                                account,
+                                client,
+                                lambda current, source=item, media_kind=kind: current.upload_media(
+                                    str(source.get("value") or ""),
+                                    media_kind,
+                                    str(source.get("name") or ""),
+                                    force_image_normalization=media_kind == "image",
+                                ),
+                            )
+                            repaired_uploads.append(upload)
+                            repair_progress = 10 + int(
+                                ((index + 1) / max(len(sources), 1)) * 20
+                            )
+                            self.db.update_task(task_id, progress=repair_progress)
+                        uploads = repaired_uploads
+                        upstream_request = client.build_generation_request(
+                            payload, uploads
+                        )
+                        fee_result, client = self._with_recovery(
+                            account,
+                            client,
+                            lambda current: current.calculate_fee(
+                                payload, uploads, upstream_request
+                            ),
+                        )
+                        actual_cost = max(float(fee_result.get("fee") or 0), 0)
+                        if not self.db.reserve_task_balance(
+                            task_id, account_id, actual_cost
+                        ):
+                            raise AkoolUpstreamError(
+                                "account balance is insufficient for the repaired image retry",
+                                code="INSUFFICIENT_CREDITS",
+                                status_code=409,
+                            )
+                        attempts.append(
+                            {
+                                "image_constraint_retry_uploads": [
+                                    item.audit_view() for item in uploads
+                                ],
+                                "calculate_fee": fee_result.get("response") or {},
+                                "fee": actual_cost,
+                            }
+                        )
+                        generated, client = self._with_recovery(
+                            account,
+                            client,
+                            lambda current: current.generate(upstream_request),
+                        )
+                        generated["fee"] = actual_cost
+                        generation_id = str(generated["generationId"])
+                        attempts.append({"image_constraint_retry_generate": generated})
+                        retry_audit = {
+                            "upload_endpoint": "POST /interface/storagesvc/api/v1/upload/signature -> PUT S3 -> POST /interface/content-api/api/v7/content/profile/create",
+                            "uploads": [item.audit_view() for item in uploads],
+                            "fee": {
+                                "method": "POST",
+                                "url": "https://akool.com/interface/content-api/api/v7/content/calculateFee",
+                                "body": fee_result.get("request") or {},
+                            },
+                            "submit": {
+                                "method": "POST",
+                                "url": "https://akool.com/interface/content-api/api/v7/content/image2Video/createBySourcePrompt/batch",
+                                "body": upstream_request,
+                            },
+                        }
+                        self.db.update_task(
+                            task_id,
+                            generation_id=generation_id,
+                            status="submitted",
+                            progress=40,
+                            upstream_request=retry_audit,
+                            upstream_response={"attempts": attempts[-30:]},
+                            estimated_cost=actual_cost,
+                            raw_status={},
+                            error_code="",
+                            error_message="",
+                        )
+                        continue
                     raise AkoolUpstreamError(
-                        failure_reason(detail),
+                        reason,
                         code="GENERATION_FAILED",
                         details=detail,
                     )

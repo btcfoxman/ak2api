@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import mimetypes
 import re
 import time
@@ -10,6 +11,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from curl_cffi import requests as curl_requests
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from app.config import normalize_proxy_url, rewrite_loopback_proxy
 from app.cookies import cookie_header_from_records, cookie_records
@@ -24,6 +26,10 @@ PROFILE_PATH = "/interface/content-api/api/v7/content/profile/create"
 FEE_PATH = "/interface/content-api/api/v7/content/calculateFee"
 SUBMIT_PATH = "/interface/content-api/api/v7/content/image2Video/createBySourcePrompt/batch"
 LIST_PATH = "/interface/content-api/api/v6/content/resourceResult/list"
+IMAGE_MIN_HEIGHT = 300
+IMAGE_MAX_HEIGHT = 6000
+IMAGE_MIN_ASPECT_RATIO = 0.4
+IMAGE_MAX_ASPECT_RATIO = 2.5
 
 
 class AkoolUpstreamError(RuntimeError):
@@ -65,7 +71,7 @@ class MediaUpload:
     raw: dict[str, Any] | None = None
 
     def audit_view(self) -> dict[str, Any]:
-        return {
+        result = {
             "profile_id": self.profile_id,
             "url": self.url,
             "kind": self.kind,
@@ -76,6 +82,10 @@ class MediaUpload:
             "width": self.width,
             "height": self.height,
         }
+        adjustment = (self.raw or {}).get("_image_adjustment")
+        if isinstance(adjustment, dict) and adjustment:
+            result["image_adjustment"] = adjustment
+        return result
 
 
 def _message(payload: Any, fallback: str) -> str:
@@ -438,6 +448,109 @@ class AkoolClient:
             return guessed
         return {"image": ".png", "video": ".mp4", "audio": ".mp3"}[kind]
 
+    @staticmethod
+    def _prepare_image(
+        data: bytes,
+        filename: str,
+        content_type: str,
+        *,
+        force: bool = False,
+    ) -> tuple[bytes, str, str, dict[str, Any]]:
+        try:
+            with Image.open(io.BytesIO(data)) as opened:
+                detected_format = str(opened.format or "").upper()
+                original_size = tuple(int(value) for value in opened.size)
+                image = ImageOps.exif_transpose(opened).copy()
+        except (UnidentifiedImageError, OSError, ValueError) as exc:
+            raise AkoolUpstreamError(
+                "image data could not be decoded",
+                code="PROVIDER_INVALID_REQUEST",
+                status_code=422,
+            ) from exc
+
+        original_width, original_height = image.size
+        if original_width <= 0 or original_height <= 0:
+            raise AkoolUpstreamError(
+                "image dimensions are invalid",
+                code="PROVIDER_INVALID_REQUEST",
+                status_code=422,
+            )
+
+        operations: list[str] = []
+        if image.size != original_size:
+            operations.append("exif_transpose")
+
+        width, height = image.size
+        aspect_ratio = width / height
+        if aspect_ratio < IMAGE_MIN_ASPECT_RATIO:
+            target_height = max(1, min(height, int(width / IMAGE_MIN_ASPECT_RATIO)))
+            top = max((height - target_height) // 2, 0)
+            image = image.crop((0, top, width, top + target_height))
+            operations.append("center_crop_min_aspect")
+        elif aspect_ratio > IMAGE_MAX_ASPECT_RATIO:
+            target_width = max(1, min(width, int(height * IMAGE_MAX_ASPECT_RATIO)))
+            left = max((width - target_width) // 2, 0)
+            image = image.crop((left, 0, left + target_width, height))
+            operations.append("center_crop_max_aspect")
+
+        width, height = image.size
+        if height < IMAGE_MIN_HEIGHT or height > IMAGE_MAX_HEIGHT:
+            target_height = (
+                IMAGE_MIN_HEIGHT if height < IMAGE_MIN_HEIGHT else IMAGE_MAX_HEIGHT
+            )
+            target_width = max(1, round(width * target_height / height))
+            image = image.resize(
+                (target_width, target_height),
+                Image.Resampling.LANCZOS,
+            )
+            operations.append(
+                "upscale_min_height"
+                if height < IMAGE_MIN_HEIGHT
+                else "downscale_max_height"
+            )
+
+        extension = Path(filename).suffix.lower()
+        known_extension = extension in {".jpg", ".jpeg", ".png", ".webp"}
+        known_content_type = content_type.lower() in {
+            "image/jpeg",
+            "image/png",
+            "image/webp",
+        }
+        reencode = bool(force or operations or not known_extension or not known_content_type)
+        output_width, output_height = image.size
+        info = {
+            "original_width": original_width,
+            "original_height": original_height,
+            "width": output_width,
+            "height": output_height,
+            "detected_format": detected_format,
+            "operations": operations,
+            "reencoded": reencode,
+        }
+        if not reencode:
+            return data, content_type, filename, info
+
+        stem = Path(filename).stem.strip() or "upload"
+        buffer = io.BytesIO()
+        has_alpha = image.mode in {"RGBA", "LA"} or (
+            image.mode == "P" and "transparency" in image.info
+        )
+        if has_alpha:
+            image.convert("RGBA").save(buffer, format="PNG", optimize=True)
+            output_type = "image/png"
+            output_name = f"{stem}-akool.png"
+        else:
+            image.convert("RGB").save(
+                buffer,
+                format="JPEG",
+                quality=95,
+                optimize=True,
+            )
+            output_type = "image/jpeg"
+            output_name = f"{stem}-akool.jpg"
+        info["reencode_reason"] = "forced_retry" if force else "compatibility"
+        return buffer.getvalue(), output_type, output_name, info
+
     def _put_signed(self, upload_url: str, data: bytes, content_type: str) -> None:
         last_error = ""
         for attempt in range(self.retries + 1):
@@ -461,10 +574,25 @@ class AkoolClient:
             code="MEDIA_UPLOAD_FAILED",
         )
 
-    def upload_media(self, source: str, kind: str, name: str = "") -> MediaUpload:
+    def upload_media(
+        self,
+        source: str,
+        kind: str,
+        name: str = "",
+        *,
+        force_image_normalization: bool = False,
+    ) -> MediaUpload:
         if kind not in {"image", "video", "audio"}:
             raise ValueError(f"unsupported media kind: {kind}")
         data, content_type, filename = self._download_source(source, name)
+        image_info: dict[str, Any] = {}
+        if kind == "image":
+            data, content_type, filename, image_info = self._prepare_image(
+                data,
+                filename,
+                content_type,
+                force=force_image_normalization,
+            )
         if len(data) > int(self.settings.media_max_bytes):
             raise AkoolUpstreamError(
                 "media exceeds configured size limit",
@@ -521,9 +649,9 @@ class AkoolClient:
             content_type=signed_content_type,
             size=len(data),
             duration_ms=int(item.get("duration") or 0),
-            width=int(item.get("file_width") or 0),
-            height=int(item.get("file_height") or 0),
-            raw=item,
+            width=int(item.get("file_width") or image_info.get("width") or 0),
+            height=int(item.get("file_height") or image_info.get("height") or 0),
+            raw={**item, "_image_adjustment": image_info} if image_info else item,
         )
 
     @staticmethod

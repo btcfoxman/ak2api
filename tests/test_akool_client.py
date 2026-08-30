@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import io
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 from app.akool_client import AkoolClient, AkoolUpstreamError, MediaUpload, result_urls
 
@@ -28,6 +30,65 @@ def upload(kind: str, index: int, duration_ms: int = 0) -> MediaUpload:
         size=100,
         duration_ms=duration_ms,
     )
+
+
+def image_bytes(size: tuple[int, int], image_format: str = "PNG") -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", size, (40, 80, 120)).save(buffer, format=image_format)
+    return buffer.getvalue()
+
+
+def test_prepare_image_crops_and_upscales_unsupported_tall_input() -> None:
+    data, content_type, filename, info = AkoolClient._prepare_image(
+        image_bytes((100, 1000)),
+        "image-1",
+        "application/octet-stream",
+    )
+
+    with Image.open(io.BytesIO(data)) as prepared:
+        assert prepared.size == (120, 300)
+    assert content_type == "image/jpeg"
+    assert filename == "image-1-akool.jpg"
+    assert info["operations"] == [
+        "center_crop_min_aspect",
+        "upscale_min_height",
+    ]
+    assert info["reencoded"] is True
+
+
+def test_prepare_image_crops_overly_wide_input() -> None:
+    data, _, _, info = AkoolClient._prepare_image(
+        image_bytes((3000, 500)),
+        "wide.png",
+        "image/png",
+    )
+
+    with Image.open(io.BytesIO(data)) as prepared:
+        assert prepared.size == (1250, 500)
+    assert info["operations"] == ["center_crop_max_aspect"]
+
+
+def test_prepare_image_preserves_compatible_known_input_unless_forced() -> None:
+    source = image_bytes((640, 480), "JPEG")
+    data, content_type, filename, info = AkoolClient._prepare_image(
+        source,
+        "ready.jpg",
+        "image/jpeg",
+    )
+    assert data == source
+    assert content_type == "image/jpeg"
+    assert filename == "ready.jpg"
+    assert info["reencoded"] is False
+
+    forced, _, forced_name, forced_info = AkoolClient._prepare_image(
+        source,
+        "ready.jpg",
+        "image/jpeg",
+        force=True,
+    )
+    assert forced
+    assert forced_name == "ready-akool.jpg"
+    assert forced_info["reencode_reason"] == "forced_retry"
 
 
 def test_generation_request_matches_captured_protocol() -> None:
