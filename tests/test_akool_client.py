@@ -6,7 +6,13 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 
-from app.akool_client import AkoolClient, AkoolUpstreamError, MediaUpload, result_urls
+from app.akool_client import (
+    AkoolAccountSuspended,
+    AkoolClient,
+    AkoolUpstreamError,
+    MediaUpload,
+    result_urls,
+)
 
 
 def settings() -> SimpleNamespace:
@@ -254,6 +260,22 @@ def test_generate_classifies_upstream_code_1104_as_insufficient_credit(monkeypat
     assert raised.value.code == "INSUFFICIENT_CREDITS"
     assert raised.value.status_code == 409
     assert raised.value.details == body
+
+
+def test_account_state_classifies_upstream_code_1108_as_suspended(monkeypatch) -> None:
+    client = AkoolClient({"cookie_header": "token=test"}, settings())
+    body = {
+        "code": 1108,
+        "msg": "Access to your account has been suspended",
+        "data": None,
+    }
+    monkeypatch.setattr(client, "_request", lambda *args, **kwargs: (body, object()))
+
+    with pytest.raises(AkoolAccountSuspended) as raised:
+        client.account_state()
+
+    assert raised.value.code == "AKOOL_ACCOUNT_SUSPENDED"
+    assert raised.value.status_code == 403
 
 
 def test_calculate_fee_always_uses_credit_mode(monkeypatch) -> None:

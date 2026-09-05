@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import app.service as service_module
 import pytest
-from app.akool_client import AkoolUpstreamError, MediaUpload
+from app.akool_client import AkoolAccountSuspended, AkoolUpstreamError, MediaUpload
 from app.db import Database
 from app.service import AKService, _DynamicSlots
 
@@ -232,6 +232,15 @@ class InsufficientThenSuccessClient(FakeAkoolClient):
             "plan": "ProMax",
             "buckets": {"credit": balance, "lock_credit": 0},
         }
+
+
+class SuspendedThenSuccessClient(FakeAkoolClient):
+    failure_account_id = 0
+
+    def generate(self, request):
+        if int(self.account["id"]) == self.failure_account_id:
+            raise AkoolAccountSuspended("Access to your account has been suspended")
+        return {"generationId": "resource-after-suspension", "raw": {"code": 1000}}
 
 
 class ImageConstraintThenSuccessClient(FakeAkoolClient):
@@ -516,6 +525,52 @@ def test_upstream_insufficient_credit_reuploads_and_switches_account(
     assert first_after["status"] == "disabled_low_balance"
     assert first_after["active_tasks"] == 0
     assert second_after["last_balance"] == 96
+    assert second_after["active_tasks"] == 0
+
+
+def test_suspended_account_is_disabled_and_task_switches_account(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(service_module, "AkoolClient", SuspendedThenSuccessClient)
+    monkeypatch.setattr(service_module, "stop_managed_browser", lambda *args: None)
+    db = Database(str(tmp_path / "suspended-switch.db"), default_concurrency=8)
+    first = db.upsert_account(
+        {"name": "suspended", "status": "active", "last_balance": 100}
+    )
+    second = db.upsert_account(
+        {"name": "ready", "status": "active", "last_balance": 100}
+    )
+    SuspendedThenSuccessClient.failure_account_id = int(first["id"])
+    payload = {
+        "kind": "video",
+        "model": "doubao-seedance-2-0-mini-260615",
+        "prompt": "test",
+        "duration": 4,
+        "resolution": "480p",
+        "aspect_ratio": "16:9",
+        "account_id": first["id"],
+        "_images": [{"value": "https://example.com/image.png", "name": "image.png"}],
+        "_videos": [],
+        "_audio": [],
+        "_estimated_cost": 0,
+    }
+    db.create_task("gen_suspended_switch", payload)
+    gateway = AKService(db, settings(tmp_path))
+
+    try:
+        gateway._run_task("gen_suspended_switch")
+    finally:
+        gateway.stop()
+
+    task = db.get_task("gen_suspended_switch")
+    first_after = db.get_account(first["id"])
+    second_after = db.get_account(second["id"])
+    assert task["status"] == "succeeded"
+    assert task["generation_id"] == "resource-after-suspension"
+    assert task["account_id"] == second["id"]
+    assert first_after["enabled"] is False
+    assert first_after["status"] == "suspended"
+    assert first_after["active_tasks"] == 0
     assert second_after["active_tasks"] == 0
 
 

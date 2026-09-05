@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from app.browser_context import (
+    AkoolBrowserAccountSuspended,
     AkoolBrowserChallengeError,
     AkoolBrowserError,
     AkoolBrowserTransportError,
@@ -24,6 +25,7 @@ from app.browser_context import (
 from app.config import normalize_proxy_url
 from app.db import Database, now_ts
 from app.akool_client import (
+    AkoolAccountSuspended,
     AkoolAuthError,
     AkoolClient,
     AkoolRiskBlocked,
@@ -451,6 +453,7 @@ class AKService:
         elif value.get("enabled") is True and before.get("status") in {
             "disabled",
             "disabled_low_balance",
+            "suspended",
         }:
             value.setdefault("status", "pending")
             value.setdefault("last_error", "")
@@ -580,6 +583,9 @@ class AKService:
             self.db.update_account(account_id, context)
             return self.check_account(account_id, recover=False)
         except Exception as exc:
+            if isinstance(exc, (AkoolAccountSuspended, AkoolBrowserAccountSuspended)):
+                self._mark_account_suspended(account_id)
+                raise
             if isinstance(exc, (AkoolBrowserChallengeError, AkoolRiskBlocked)):
                 status = "challenge_required"
             elif isinstance(exc, AkoolBrowserTransportError):
@@ -601,7 +607,10 @@ class AKService:
     def _recover_client(self, account: dict[str, Any]) -> AkoolClient:
         if not bool(self.settings.browser_recovery_enabled):
             raise AkoolAuthError("Akool session recovery is disabled")
-        context = refresh_account_context(account, self.settings)
+        try:
+            context = refresh_account_context(account, self.settings)
+        except AkoolBrowserAccountSuspended as exc:
+            raise AkoolAccountSuspended() from exc
         updated = self.db.update_account(int(account["id"]), context) or account
         return AkoolClient(updated, self.settings)
 
@@ -645,6 +654,9 @@ class AKService:
                 )
             return self.db.get_account(account_id, include_secrets=False) or updated or {}
         except Exception as exc:
+            if isinstance(exc, (AkoolAccountSuspended, AkoolBrowserAccountSuspended)):
+                self._mark_account_suspended(account_id)
+                raise
             status = "login_required" if isinstance(
                 exc, (AkoolAuthError, AkoolRiskBlocked, AkoolBrowserError)
             ) else "network_error"
@@ -653,6 +665,21 @@ class AKService:
                 {"status": status, "last_error": str(exc), "last_checked_at": now_ts()},
             )
             raise
+
+    def _mark_account_suspended(self, account_id: int) -> dict[str, Any] | None:
+        account = self.db.get_account(account_id, include_secrets=False)
+        if not account:
+            return None
+        stop_managed_browser(account_id, int(account.get("cdp_port") or 0))
+        return self.db.update_account(
+            account_id,
+            {
+                "enabled": False,
+                "status": "suspended",
+                "last_error": "Akool account has been suspended",
+                "last_checked_at": now_ts(),
+            },
+        )
 
     def _store_account_state(
         self,
@@ -853,6 +880,33 @@ class AKService:
                 float(self.settings.low_balance_disable_threshold),
             )
 
+    def _release_suspended_account(
+        self,
+        *,
+        task_id: str,
+        account: dict[str, Any],
+        error: AkoolUpstreamError,
+        phase: str,
+        attempts: list[dict[str, Any]],
+    ) -> None:
+        account_id = int(account["id"])
+        attempts.append(
+            {
+                f"{phase}_error": {
+                    "account_id": account_id,
+                    "code": error.code,
+                    "message": "Akool account has been suspended",
+                }
+            }
+        )
+        self.db.update_task(
+            task_id,
+            upstream_response={"attempts": attempts[-30:]},
+            status="preparing",
+        )
+        self._mark_account_suspended(account_id)
+        self.db.release_account(account_id, task_id=task_id)
+
     def _run_task(self, task_id: str) -> None:
         task = self.db.get_task(task_id)
         if not task or task.get("status") in TERMINAL_STATUSES:
@@ -896,11 +950,26 @@ class AKService:
                 )
                 if generation_id:
                     break
+                uploads = []
 
                 if before_balance is None:
-                    state, client = self._with_recovery(
-                        account, client, lambda current: current.account_state()
-                    )
+                    try:
+                        state, client = self._with_recovery(
+                            account, client, lambda current: current.account_state()
+                        )
+                    except AkoolAccountSuspended as exc:
+                        self._release_suspended_account(
+                            task_id=task_id,
+                            account=account,
+                            error=exc,
+                            phase="account_state",
+                            attempts=attempts,
+                        )
+                        excluded_ids.add(account_id)
+                        account = None
+                        client = None
+                        before_balance = None
+                        continue
                     before_balance = float(state.get("available_balance") or 0)
                     self.db.update_account(
                         account_id,
@@ -917,19 +986,35 @@ class AKService:
                 self.db.update_task(
                     task_id, status="preparing", progress=5, channel="akapi"
                 )
-                for index, (kind, item) in enumerate(sources):
-                    upload, client = self._with_recovery(
-                        account,
-                        client,
-                        lambda current, source=item, media_kind=kind: current.upload_media(
-                            str(source.get("value") or ""),
-                            media_kind,
-                            str(source.get("name") or ""),
-                        ),
+                try:
+                    for index, (kind, item) in enumerate(sources):
+                        upload, client = self._with_recovery(
+                            account,
+                            client,
+                            lambda current, source=item, media_kind=kind: current.upload_media(
+                                str(source.get("value") or ""),
+                                media_kind,
+                                str(source.get("name") or ""),
+                            ),
+                        )
+                        uploads.append(upload)
+                        progress = 5 + int(
+                            ((index + 1) / max(len(sources), 1)) * 25
+                        )
+                        self.db.update_task(task_id, progress=progress)
+                except AkoolAccountSuspended as exc:
+                    self._release_suspended_account(
+                        task_id=task_id,
+                        account=account,
+                        error=exc,
+                        phase="upload",
+                        attempts=attempts,
                     )
-                    uploads.append(upload)
-                    progress = 5 + int(((index + 1) / max(len(sources), 1)) * 25)
-                    self.db.update_task(task_id, progress=progress)
+                    excluded_ids.add(account_id)
+                    account = None
+                    client = None
+                    before_balance = None
+                    continue
 
                 upstream_request = client.build_generation_request(payload, uploads)
                 try:
@@ -941,16 +1026,25 @@ class AKService:
                         ),
                     )
                 except AkoolUpstreamError as exc:
-                    if str(exc.code) != "INSUFFICIENT_CREDITS":
+                    if isinstance(exc, AkoolAccountSuspended):
+                        self._release_suspended_account(
+                            task_id=task_id,
+                            account=account,
+                            error=exc,
+                            phase="calculate_fee",
+                            attempts=attempts,
+                        )
+                    elif str(exc.code) == "INSUFFICIENT_CREDITS":
+                        self._release_insufficient_credit_account(
+                            task_id=task_id,
+                            account=account,
+                            client=client,
+                            error=exc,
+                            phase="calculate_fee",
+                            attempts=attempts,
+                        )
+                    else:
                         raise
-                    self._release_insufficient_credit_account(
-                        task_id=task_id,
-                        account=account,
-                        client=client,
-                        error=exc,
-                        phase="calculate_fee",
-                        attempts=attempts,
-                    )
                     excluded_ids.add(account_id)
                     account = None
                     client = None
@@ -999,16 +1093,25 @@ class AKService:
                         account, client, lambda current: current.generate(upstream_request)
                     )
                 except AkoolUpstreamError as exc:
-                    if str(exc.code) != "INSUFFICIENT_CREDITS":
+                    if isinstance(exc, AkoolAccountSuspended):
+                        self._release_suspended_account(
+                            task_id=task_id,
+                            account=account,
+                            error=exc,
+                            phase="generate",
+                            attempts=attempts,
+                        )
+                    elif str(exc.code) == "INSUFFICIENT_CREDITS":
+                        self._release_insufficient_credit_account(
+                            task_id=task_id,
+                            account=account,
+                            client=client,
+                            error=exc,
+                            phase="generate",
+                            attempts=attempts,
+                        )
+                    else:
                         raise
-                    self._release_insufficient_credit_account(
-                        task_id=task_id,
-                        account=account,
-                        client=client,
-                        error=exc,
-                        phase="generate",
-                        attempts=attempts,
-                    )
                     excluded_ids.add(account_id)
                     account = None
                     client = None
@@ -1069,6 +1172,11 @@ class AKService:
                         balance_fresh = True
                     except Exception as exc:
                         LOGGER.warning("balance refresh failed after %s: %s", task_id, exc)
+                        if isinstance(
+                            exc,
+                            (AkoolAccountSuspended, AkoolBrowserAccountSuspended),
+                        ):
+                            self._mark_account_suspended(account_id)
                     actual_cost = float(actual_cost or 0)
                     self.db.update_task(
                         task_id,
@@ -1226,7 +1334,14 @@ class AKService:
                 raw_status=getattr(exc, "details", None) or {},
                 completed_at=now_ts(),
             )
-            if account and isinstance(exc, (AkoolAuthError, AkoolRiskBlocked, AkoolBrowserError)):
+            if account and isinstance(
+                exc,
+                (AkoolAccountSuspended, AkoolBrowserAccountSuspended),
+            ):
+                self._mark_account_suspended(int(account["id"]))
+            elif account and isinstance(
+                exc, (AkoolAuthError, AkoolRiskBlocked, AkoolBrowserError)
+            ):
                 self.db.update_account(
                     int(account["id"]),
                     {"status": "login_required", "last_error": str(exc), "last_checked_at": now_ts()},
@@ -1454,6 +1569,12 @@ class AKService:
                 )
         except Exception as exc:
             LOGGER.info("account %s maintenance check failed: %s", account_id, exc)
+            if isinstance(
+                exc,
+                (AkoolAccountSuspended, AkoolBrowserAccountSuspended),
+            ):
+                self._mark_account_suspended(account_id)
+                return
             account = self.db.get_account(account_id, include_secrets=False) or {}
             if account.get("enabled") and account.get("auto_login") and account.get(
                 "status"

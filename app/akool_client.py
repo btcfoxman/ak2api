@@ -59,6 +59,11 @@ class AkoolRiskBlocked(AkoolUpstreamError):
         super().__init__(message, code="AKOOL_RISK_BLOCKED", status_code=403)
 
 
+class AkoolAccountSuspended(AkoolUpstreamError):
+    def __init__(self, message: str = "Akool account has been suspended"):
+        super().__init__(message, code="AKOOL_ACCOUNT_SUSPENDED", status_code=403)
+
+
 @dataclass(slots=True)
 class MediaUpload:
     profile_id: str
@@ -131,6 +136,11 @@ def _auth_message(value: str) -> bool:
             "session expired",
         )
     )
+
+
+def _account_suspended_message(value: str) -> bool:
+    text = value.lower()
+    return "account has been suspended" in text or "account is suspended" in text
 
 
 def result_urls(detail: dict[str, Any]) -> list[str]:
@@ -247,6 +257,8 @@ class AkoolClient:
                 except Exception:
                     body = {"message": response.text[:2000], "content_type": content_type}
                 message = _message(body, f"Akool HTTP {response.status_code}")
+                if _account_suspended_message(message):
+                    raise AkoolAccountSuspended(message)
                 if response.status_code in {401, 419} or _auth_message(message):
                     raise AkoolAuthError(message)
                 if response.status_code == 403 or _risk_message(message):
@@ -298,6 +310,8 @@ class AkoolClient:
         if code in (1000, "1000"):
             return body
         message = _message(body, f"{operation} failed")
+        if code in (1108, "1108") or _account_suspended_message(message):
+            raise AkoolAccountSuspended(message)
         if _risk_message(message):
             raise AkoolRiskBlocked(message)
         if _auth_message(message):

@@ -10,7 +10,7 @@ import urllib.request
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import websocket
 
@@ -32,6 +32,35 @@ class AkoolBrowserChallengeError(AkoolBrowserError):
 
 class AkoolBrowserTransportError(AkoolBrowserError):
     pass
+
+
+class AkoolBrowserAccountSuspended(AkoolBrowserError):
+    pass
+
+
+def _safe_page_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "<unknown>"
+    try:
+        parsed = urlsplit(raw)
+        query = urlencode(
+            [
+                (
+                    key,
+                    "REDACTED"
+                    if any(
+                        marker in key.lower()
+                        for marker in ("password", "passwd", "token", "secret")
+                    )
+                    else item,
+                )
+                for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+            ]
+        )
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
+    except (TypeError, ValueError):
+        return raw.split("?", 1)[0]
 
 
 class _CDP:
@@ -532,7 +561,15 @@ def refresh_account_context(account: dict[str, Any], settings: Any) -> dict[str,
                         or body.get("message")
                         or ""
                     )
+                    if int(body.get("code") or 0) == 1108 or (
+                        "account has been suspended" in last_error.lower()
+                    ):
+                        raise AkoolBrowserAccountSuspended(
+                            "Akool account has been suspended"
+                        )
                 except AkoolBrowserTransportError:
+                    raise
+                except AkoolBrowserAccountSuspended:
                     raise
                 except Exception as exc:
                     last_error = str(exc)
@@ -550,7 +587,7 @@ def refresh_account_context(account: dict[str, Any], settings: Any) -> dict[str,
                         raise AkoolBrowserChallengeError(
                             "Akool browser challenge requires manual verification"
                             + (f": {detail}" if detail else "")
-                            + f"; last page={last_page.get('url') or '<unknown>'}"
+                            + f"; last page={_safe_page_url(last_page.get('url'))}"
                         )
                     time.sleep(1)
                     continue
@@ -585,7 +622,7 @@ def refresh_account_context(account: dict[str, Any], settings: Any) -> dict[str,
 
             raise AkoolBrowserError(
                 "Akool login did not produce a valid session"
-                f"; last page={last_page.get('url') or '<unknown>'}"
+                f"; last page={_safe_page_url(last_page.get('url'))}"
                 + (f"; {last_error}" if last_error else "")
             )
         finally:
