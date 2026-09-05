@@ -8,6 +8,7 @@ import time
 import uuid
 from collections import Counter, deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from app.browser_context import (
@@ -114,6 +115,7 @@ class AKService:
         "request_retries",
         "account_maintenance_interval_seconds",
         "account_maintenance_workers",
+        "daily_checkin_enabled",
         "browser_recovery_enabled",
         "browser_timeout_seconds",
         "browser_login_workers",
@@ -151,6 +153,7 @@ class AKService:
         self._account_guard = threading.RLock()
         self._running_logins: set[int] = set()
         self._running_maintenance: set[int] = set()
+        self._active_maintenance: set[int] = set()
         self._resetting_profiles: set[int] = set()
         self._stop = threading.Event()
         self._maintenance_wakeup = threading.Event()
@@ -229,6 +232,7 @@ class AKService:
         if {
             "account_maintenance_interval_seconds",
             "account_maintenance_workers",
+            "daily_checkin_enabled",
         } & values.keys():
             self._maintenance_wakeup.set()
         return self.runtime_settings()
@@ -613,7 +617,13 @@ class AKService:
             recovered = self._recover_client(account)
             return operation(recovered), recovered
 
-    def check_account(self, account_id: int, *, recover: bool = True) -> dict[str, Any]:
+    def check_account(
+        self,
+        account_id: int,
+        *,
+        recover: bool = True,
+        enforce_low_balance: bool = True,
+    ) -> dict[str, Any]:
         account = self.db.get_account(account_id)
         if not account:
             raise KeyError("account not found")
@@ -623,24 +633,10 @@ class AKService:
                 state, client = self._with_recovery(account, client, lambda item: item.account_state())
             else:
                 state = client.account_state()
-            details = state.get("buckets") or {}
-            updated = self.db.update_account(
-                account_id,
-                {
-                    "email": state.get("email") or account.get("email") or "",
-                    "user_id": state.get("user_id") or account.get("user_id") or "",
-                    "team_id": state.get("team_id") or account.get("team_id") or "",
-                    "access_token": state.get("token") or account.get("access_token") or "",
-                    "last_balance": state.get("available_balance"),
-                    "balance_details": details,
-                    "plan": state.get("plan") or "",
-                    "status": "active",
-                    "last_error": "",
-                    "last_checked_at": now_ts(),
-                },
-            )
+            updated = self._store_account_state(account_id, account, state)
             if (
-                updated
+                enforce_low_balance
+                and updated
                 and float(updated.get("last_balance") or 0)
                 < float(self.settings.low_balance_disable_threshold)
             ):
@@ -657,6 +653,28 @@ class AKService:
                 {"status": status, "last_error": str(exc), "last_checked_at": now_ts()},
             )
             raise
+
+    def _store_account_state(
+        self,
+        account_id: int,
+        account: dict[str, Any],
+        state: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        return self.db.update_account(
+            account_id,
+            {
+                "email": state.get("email") or account.get("email") or "",
+                "user_id": state.get("user_id") or account.get("user_id") or "",
+                "team_id": state.get("team_id") or account.get("team_id") or "",
+                "access_token": state.get("token") or account.get("access_token") or "",
+                "last_balance": state.get("available_balance"),
+                "balance_details": state.get("buckets") or {},
+                "plan": state.get("plan") or "",
+                "status": "active",
+                "last_error": "",
+                "last_checked_at": now_ts(),
+            },
+        )
 
     def create_task(self, payload: dict[str, Any], *, caller_request: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._task_submit_lock:
@@ -729,13 +747,16 @@ class AKService:
         preferred = payload.get("account_id")
         if recovering and not preferred:
             preferred = task.get("account_id")
-        if preferred and exclude_ids and int(preferred) in exclude_ids:
+        excluded = {int(value) for value in (exclude_ids or set())}
+        if preferred and int(preferred) in excluded:
             preferred = None
         reservation = 0 if recovering else float(task.get("estimated_cost") or 0)
         while time.monotonic() < deadline:
+            with self._account_guard:
+                unavailable = excluded | set(self._active_maintenance)
             account = self.db.acquire_account(
                 int(preferred) if preferred else None,
-                exclude_ids=exclude_ids,
+                exclude_ids=unavailable,
                 kind="video",
                 minimum_balance=reservation,
                 task_id=str(task["id"]),
@@ -744,9 +765,9 @@ class AKService:
             )
             if account:
                 return account
-            available = self.db.available_account_count(exclude_ids)
+            available = self.db.available_account_count(excluded)
             if available <= 0:
-                if exclude_ids:
+                if excluded:
                     raise AkoolUpstreamError(
                         "no remaining Akool account has enough credit for this task",
                         code="INSUFFICIENT_CREDITS",
@@ -758,7 +779,7 @@ class AKService:
                     status_code=503,
                 )
             if reservation > 0 and self.db.available_account_count(
-                exclude_ids,
+                excluded,
                 minimum_balance=reservation,
             ) <= 0:
                 raise AkoolUpstreamError(
@@ -1310,21 +1331,87 @@ class AKService:
             raise IndexError("media not found")
         return str(items[index].get("value") or "")
 
-    def _maintenance_loop(self) -> None:
-        while not self._stop.is_set():
-            interrupted = self._maintenance_wakeup.wait(
-                int(self.settings.account_maintenance_interval_seconds)
+    @staticmethod
+    def _today_utc() -> str:
+        return datetime.now(timezone.utc).date().isoformat()
+
+    def _daily_checkin_due(self, account: dict[str, Any]) -> bool:
+        if not bool(self.settings.daily_checkin_enabled):
+            return False
+        details = account.get("balance_details") or {}
+        stats = details.get("sign_reward_stats") or {}
+        return str(stats.get("last_sign") or "") != self._today_utc()
+
+    def _store_daily_checkin_stats(
+        self,
+        account_id: int,
+        stats: dict[str, Any],
+    ) -> None:
+        account = self.db.get_account(account_id, include_secrets=False) or {}
+        details = dict(account.get("balance_details") or {})
+        details["sign_reward_stats"] = dict(stats)
+        self.db.update_account(account_id, {"balance_details": details})
+
+    def _run_daily_checkin(self, account_id: int) -> None:
+        account = self.db.get_account(account_id, include_secrets=True)
+        if not account or not account.get("enabled"):
+            return
+        client = AkoolClient(account, self.settings)
+        stats = client.daily_checkin_status()
+        self._store_daily_checkin_stats(account_id, stats)
+        if bool(stats.get("today_signed")):
+            return
+        if not bool(stats.get("can_checkedin")):
+            LOGGER.info(
+                "account %s daily check-in is unavailable: %s",
+                account_id,
+                stats.get("error_msg") or stats.get("error_code") or "unknown reason",
             )
+            return
+
+        reward = client.daily_checkin()
+        signed_stats = {
+            **stats,
+            **reward,
+            "last_sign": self._today_utc(),
+            "today_signed": True,
+            "can_checkedin": False,
+        }
+        self._store_daily_checkin_stats(account_id, signed_stats)
+        LOGGER.info(
+            "account %s daily check-in completed, reward credits=%s",
+            account_id,
+            reward.get("credits"),
+        )
+        try:
+            state = client.account_state()
+            self._store_account_state(account_id, account, state)
+        except Exception as exc:
+            LOGGER.warning(
+                "account %s daily check-in balance refresh failed: %s",
+                account_id,
+                exc,
+            )
+
+    def _maintenance_loop(self) -> None:
+        first_pass = True
+        while not self._stop.is_set():
+            if not (first_pass and bool(self.settings.daily_checkin_enabled)):
+                self._maintenance_wakeup.wait(
+                    int(self.settings.account_maintenance_interval_seconds)
+                )
+            first_pass = False
             self._maintenance_wakeup.clear()
             if self._stop.is_set():
                 break
-            if interrupted:
-                continue
             for account in self.db.list_accounts(include_secrets=False):
                 if (
                     account.get("enabled")
-                    and account.get("auto_login")
                     and not int(account.get("active_tasks") or 0)
+                    and (
+                        account.get("auto_login")
+                        or self._daily_checkin_due(account)
+                    )
                 ):
                     account_id = int(account["id"])
                     with self._account_guard:
@@ -1342,8 +1429,29 @@ class AKService:
 
     def _maintenance_check(self, account_id: int) -> None:
         self._maintenance_slots.acquire()
+        with self._account_guard:
+            self._active_maintenance.add(int(account_id))
         try:
-            self.check_account(account_id, recover=False)
+            current = self.db.get_account(account_id, include_secrets=False) or {}
+            if not current.get("enabled") or int(current.get("active_tasks") or 0):
+                return
+            account = self.check_account(
+                account_id,
+                recover=False,
+                enforce_low_balance=False,
+            )
+            if self._daily_checkin_due(account):
+                self._run_daily_checkin(account_id)
+            current = self.db.get_account(account_id, include_secrets=False) or {}
+            if (
+                current.get("enabled")
+                and float(current.get("last_balance") or 0)
+                < float(self.settings.low_balance_disable_threshold)
+            ):
+                self.db.disable_account_for_low_balance_if_idle(
+                    account_id,
+                    float(self.settings.low_balance_disable_threshold),
+                )
         except Exception as exc:
             LOGGER.info("account %s maintenance check failed: %s", account_id, exc)
             account = self.db.get_account(account_id, include_secrets=False) or {}
@@ -1352,11 +1460,14 @@ class AKService:
             ) in {"login_required", "network_error"}:
                 self.schedule_login(account_id)
         finally:
+            with self._account_guard:
+                self._active_maintenance.discard(int(account_id))
             self._maintenance_slots.release()
 
     def _finish_maintenance(self, account_id: int) -> None:
         with self._account_guard:
             self._running_maintenance.discard(int(account_id))
+            self._active_maintenance.discard(int(account_id))
 
     def status(self) -> dict[str, Any]:
         tasks = self.db.list_task_summaries(100)

@@ -40,3 +40,16 @@ Seedance 2.5 使用 `doubao/seedance-2-5/reference-to-video`，并携带
 随后在新账号下重新上传素材并再次询价、提交。
 
 SSE 在记录中出现 HTTP/2 协议错误，因此实现以资源列表轮询为准。提交接口 HTTP 200 仍需检查业务 `code == 1000` 和非空 `successList`。
+
+## 每日签到
+
+2026-09-05 原生 CDP 记录确认签到链路：
+
+1. `GET /interface/faceswap-api/api/v6/content/sign/stats` 查询当天状态。
+2. 仅在 `today_signed=false` 且 `can_checkedin=true` 时，无请求体调用
+   `POST /interface/faceswap-api/api/v6/content/sign`。
+3. 签到成功后重新调用账号信息接口，刷新 `credit`、`sign_reward_stats` 和
+   `last_daily_credit_add_time`。
+
+签到 POST 不自动重放。实现先以 UTC 日期和本地保存的 `last_sign` 去重，再以上游状态为准，
+并复用账号 Cookie 与固定代理。低余额自动禁用判断在签到及余额刷新之后执行，避免尚可领取奖励的账号被提前禁用。

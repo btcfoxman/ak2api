@@ -77,6 +77,7 @@ class Settings:
     request_retries: int
     account_maintenance_interval_seconds: int
     account_maintenance_workers: int
+    daily_checkin_enabled: bool
     account_default_concurrency: int
     media_timeout_seconds: int
     media_max_bytes: int
@@ -124,6 +125,7 @@ def load_settings() -> Settings:
         account_maintenance_workers=_env_int(
             "AK_ACCOUNT_MAINTENANCE_WORKERS", 3, 1, 20
         ),
+        daily_checkin_enabled=_env_bool("AK_DAILY_CHECKIN_ENABLED", True),
         account_default_concurrency=_env_int(
             "AK_ACCOUNT_DEFAULT_CONCURRENCY", 8, 1, 100
         ),

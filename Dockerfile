@@ -18,4 +18,4 @@ RUN mkdir -p /app/data/ak-chrome-profiles
 
 EXPOSE 8795
 
-CMD ["sh", "-c", "Xvfb :99 -screen 0 1280x960x24 -nolisten tcp >/tmp/xvfb.log 2>&1 & export DISPLAY=:99; sleep 1; exec uvicorn app.main:app --host 0.0.0.0 --port 8795"]
+CMD ["xvfb-run", "-a", "-s", "-screen 0 1280x960x24 -nolisten tcp", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8795"]

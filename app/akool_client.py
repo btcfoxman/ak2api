@@ -21,6 +21,8 @@ from app.model_catalog import model_spec
 AKOOL_ORIGIN = "https://akool.com"
 VERIFY_PATH = "/interface/user-api/api/v6/verify/user"
 ACCOUNT_PATH = "/interface/faceswap-api/api/v1/faceswap/user/info"
+DAILY_CHECKIN_STATS_PATH = "/interface/faceswap-api/api/v6/content/sign/stats"
+DAILY_CHECKIN_PATH = "/interface/faceswap-api/api/v6/content/sign"
 SIGNATURE_PATH = "/interface/storagesvc/api/v1/upload/signature"
 PROFILE_PATH = "/interface/content-api/api/v7/content/profile/create"
 FEE_PATH = "/interface/content-api/api/v7/content/calculateFee"
@@ -361,9 +363,37 @@ class AkoolClient:
                 "is_fraud": quota.get("is_fraud", user.get("is_fraud")),
                 "total_task_cnt": quota.get("total_task_cnt"),
                 "subscription_credit": quota.get("subscription_credit") or {},
+                "sign_reward_stats": quota.get("sign_reward_stats") or {},
+                "last_daily_credit_add_time": quota.get("last_daily_credit_add_time"),
             },
             "raw": {"verify": verified, "account": state},
         }
+
+    def daily_checkin_status(self) -> dict[str, Any]:
+        body, _ = self._request(
+            "GET",
+            DAILY_CHECKIN_STATS_PATH,
+            retry=True,
+            referer=f"{AKOOL_ORIGIN}/zh-cn/pricing",
+        )
+        body = self._require_ok(body, "daily check-in status")
+        data = body.get("data") or {}
+        if not isinstance(data, dict):
+            raise AkoolUpstreamError("daily check-in status returned invalid data")
+        return dict(data)
+
+    def daily_checkin(self) -> dict[str, Any]:
+        body, _ = self._request(
+            "POST",
+            DAILY_CHECKIN_PATH,
+            retry=False,
+            referer=f"{AKOOL_ORIGIN}/zh-cn/pricing",
+        )
+        body = self._require_ok(body, "daily check-in")
+        data = body.get("data") or {}
+        if not isinstance(data, dict):
+            raise AkoolUpstreamError("daily check-in returned invalid data")
+        return dict(data)
 
     @staticmethod
     def _decode_data_url(value: str) -> tuple[bytes, str] | None:

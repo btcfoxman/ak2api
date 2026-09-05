@@ -85,6 +85,7 @@ class SettingsPatch(BaseModel):
         default=None, ge=30, le=86400
     )
     account_maintenance_workers: int | None = Field(default=None, ge=1, le=20)
+    daily_checkin_enabled: bool | None = None
     browser_recovery_enabled: bool | None = None
     browser_timeout_seconds: int | None = Field(default=None, ge=30, le=900)
     browser_login_workers: int | None = Field(default=None, ge=1, le=10)

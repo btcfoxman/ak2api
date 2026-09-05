@@ -64,6 +64,7 @@ def settings(tmp_path) -> SimpleNamespace:
         request_retries=1,
         account_maintenance_interval_seconds=300,
         account_maintenance_workers=1,
+        daily_checkin_enabled=True,
         account_default_concurrency=8,
         media_timeout_seconds=30,
         media_max_bytes=1024 * 1024,
@@ -136,6 +137,43 @@ class FakeAkoolClient:
             "plan": "ProMax",
             "buckets": {"credit": 96, "lock_credit": 0},
         }
+
+
+class DailyCheckinClient(FakeAkoolClient):
+    today = ""
+    signed = False
+    status_calls = 0
+    checkin_calls = 0
+
+    def account_state(self):
+        balance = 5 if self.signed else 0
+        return {
+            "balance": balance,
+            "available_balance": balance,
+            "plan": "ProMax",
+            "buckets": {
+                "credit": balance,
+                "lock_credit": 0,
+                "sign_reward_stats": {
+                    "last_sign": self.today if self.signed else "2026-09-01",
+                    "today_signed": self.signed,
+                },
+            },
+        }
+
+    def daily_checkin_status(self):
+        type(self).status_calls += 1
+        return {
+            "last_sign": "2026-09-01",
+            "today_signed": False,
+            "can_checkedin": True,
+            "total_credits": 20,
+        }
+
+    def daily_checkin(self):
+        type(self).checkin_calls += 1
+        type(self).signed = True
+        return {"day_number": 1, "credits": 5, "total_credits": 25}
 
 
 class InsufficientThenSuccessClient(FakeAkoolClient):
@@ -304,6 +342,37 @@ def test_account_acquisition_fails_fast_when_all_balances_are_too_low(
         gateway.stop()
 
     assert raised.value.code == "INSUFFICIENT_CREDITS"
+
+
+def test_task_account_acquisition_avoids_only_active_maintenance(tmp_path) -> None:
+    db = Database(str(tmp_path / "maintenance-exclusion.db"), default_concurrency=8)
+    first = db.upsert_account(
+        {"name": "first", "status": "active", "last_balance": 100}
+    )
+    second = db.upsert_account(
+        {"name": "second", "status": "active", "last_balance": 100}
+    )
+    task = db.create_task(
+        "gen_maintenance_exclusion",
+        {
+            "kind": "video",
+            "model": "doubao-seedance-2-0-mini-260615",
+            "prompt": "test",
+            "_estimated_cost": 0,
+        },
+    )
+    gateway = AKService(db, settings(tmp_path))
+    with gateway._account_guard:
+        gateway._running_maintenance.add(int(first["id"]))
+        gateway._active_maintenance.add(int(first["id"]))
+
+    try:
+        acquired = gateway._acquire_task_account(task, time.monotonic() + 1)
+        assert acquired["id"] == second["id"]
+    finally:
+        if "acquired" in locals():
+            db.release_account(acquired["id"], task_id=task["id"])
+        gateway.stop()
 
 
 def test_image_constraint_failure_reencodes_and_submits_once(
@@ -577,3 +646,50 @@ def test_video_reference_input_setting_rejects_new_tasks_and_updates_models(
         assert gateway.models()[0]["capabilities"]["media_limits"]["videos"] > 0
     finally:
         gateway.stop()
+
+
+def test_maintenance_checks_in_once_and_refreshes_balance_before_disabling(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    DailyCheckinClient.signed = False
+    DailyCheckinClient.status_calls = 0
+    DailyCheckinClient.checkin_calls = 0
+    monkeypatch.setattr(service_module, "AkoolClient", DailyCheckinClient)
+    db = Database(str(tmp_path / "daily-checkin.db"), default_concurrency=8)
+    account = db.upsert_account(
+        {
+            "name": "daily",
+            "status": "active",
+            "last_balance": 0,
+            "enabled": True,
+        }
+    )
+    gateway = AKService(db, settings(tmp_path))
+    DailyCheckinClient.today = gateway._today_utc()
+
+    try:
+        gateway._maintenance_check(account["id"])
+        gateway._maintenance_check(account["id"])
+    finally:
+        gateway.stop()
+
+    refreshed = db.get_account(account["id"], include_secrets=False)
+    assert DailyCheckinClient.status_calls == 1
+    assert DailyCheckinClient.checkin_calls == 1
+    assert refreshed["enabled"] is True
+    assert refreshed["last_balance"] == 5
+    assert refreshed["balance_details"]["sign_reward_stats"]["last_sign"] == (
+        DailyCheckinClient.today
+    )
+
+
+def test_daily_checkin_setting_can_be_disabled_at_runtime(tmp_path) -> None:
+    db = Database(str(tmp_path / "daily-setting.db"), default_concurrency=8)
+    gateway = AKService(db, settings(tmp_path))
+    try:
+        updated = gateway.update_runtime_settings({"daily_checkin_enabled": False})
+    finally:
+        gateway.stop()
+
+    assert updated["daily_checkin_enabled"] is False

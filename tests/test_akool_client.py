@@ -337,3 +337,45 @@ def test_generation_status_four_is_failed_with_upstream_reason(monkeypatch) -> N
     assert detail["status"] == "FAILED"
     assert detail["providerStatus"] == 4
     assert detail["error"] == "Request failed. Please check your network and try again."
+
+
+def test_daily_checkin_matches_captured_status_then_submit_protocol(monkeypatch) -> None:
+    client = AkoolClient({"cookie_header": "token=test"}, settings())
+    calls = []
+
+    def request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        if method == "GET":
+            return {
+                "code": 1000,
+                "msg": "OK",
+                "data": {
+                    "today_signed": False,
+                    "can_checkedin": True,
+                    "last_sign": "2026-09-01",
+                },
+            }, object()
+        return {
+            "code": 1000,
+            "msg": "OK",
+            "data": {"day_number": 1, "credits": 5, "total_credits": 25},
+        }, object()
+
+    monkeypatch.setattr(client, "_request", request)
+
+    status = client.daily_checkin_status()
+    reward = client.daily_checkin()
+
+    assert status["can_checkedin"] is True
+    assert reward["credits"] == 5
+    assert calls[0][0:2] == (
+        "GET",
+        "/interface/faceswap-api/api/v6/content/sign/stats",
+    )
+    assert calls[0][2]["retry"] is True
+    assert calls[1][0:2] == (
+        "POST",
+        "/interface/faceswap-api/api/v6/content/sign",
+    )
+    assert calls[1][2]["retry"] is False
+    assert all(call[2]["referer"].endswith("/zh-cn/pricing") for call in calls)
