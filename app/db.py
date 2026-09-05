@@ -264,6 +264,21 @@ class Database:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS account_media_cache (
+                    account_id INTEGER NOT NULL,
+                    cache_key TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    content_type TEXT NOT NULL DEFAULT '',
+                    size INTEGER NOT NULL DEFAULT 0,
+                    width INTEGER NOT NULL DEFAULT 0,
+                    height INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY(account_id, cache_key),
+                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+                );
                 """
             )
             account_columns = {
@@ -673,6 +688,65 @@ class Database:
                 clean,
             )
         return self.get_account(account_id)
+
+    def get_account_media_cache(
+        self,
+        account_id: int,
+        cache_key: str,
+    ) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM account_media_cache
+                WHERE account_id = ? AND cache_key = ?
+                """,
+                (int(account_id), str(cache_key)),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def set_account_media_cache(
+        self,
+        account_id: int,
+        cache_key: str,
+        media: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = now_ts()
+        values = {
+            "account_id": int(account_id),
+            "cache_key": str(cache_key),
+            "profile_id": str(media.get("profile_id") or ""),
+            "url": str(media.get("url") or ""),
+            "content_type": str(media.get("content_type") or ""),
+            "size": max(int(media.get("size") or 0), 0),
+            "width": max(int(media.get("width") or 0), 0),
+            "height": max(int(media.get("height") or 0), 0),
+            "now": now,
+        }
+        if not values["profile_id"] or not values["url"]:
+            raise ValueError("cached account media requires profile_id and url")
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO account_media_cache (
+                    account_id, cache_key, profile_id, url, content_type,
+                    size, width, height, created_at, updated_at
+                ) VALUES (
+                    :account_id, :cache_key, :profile_id, :url, :content_type,
+                    :size, :width, :height, :now, :now
+                )
+                ON CONFLICT(account_id, cache_key) DO UPDATE SET
+                    profile_id = excluded.profile_id,
+                    url = excluded.url,
+                    content_type = excluded.content_type,
+                    size = excluded.size,
+                    width = excluded.width,
+                    height = excluded.height,
+                    updated_at = excluded.updated_at
+                """,
+                values,
+            )
+        return self.get_account_media_cache(account_id, cache_key) or values
 
     def disable_account_for_low_balance_if_idle(
         self,

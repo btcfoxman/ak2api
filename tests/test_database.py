@@ -15,6 +15,35 @@ def test_duplicate_email_updates_existing_account(tmp_path) -> None:
     assert len(db.list_accounts()) == 1
 
 
+def test_account_media_cache_persists_and_cascades_on_delete(tmp_path) -> None:
+    db = Database(str(tmp_path / "media-cache.db"), default_concurrency=8)
+    account = db.upsert_account({"name": "cached", "enabled": False})
+
+    stored = db.set_account_media_cache(
+        account["id"],
+        "text_to_video_black_1024_v1",
+        {
+            "profile_id": "profile-black",
+            "url": "https://cdn.example.com/black.jpg",
+            "content_type": "image/jpeg",
+            "size": 6365,
+            "width": 1024,
+            "height": 1024,
+        },
+    )
+
+    assert stored["profile_id"] == "profile-black"
+    assert stored["width"] == 1024
+    assert db.delete_account(account["id"]) is True
+    assert (
+        db.get_account_media_cache(
+            account["id"],
+            "text_to_video_black_1024_v1",
+        )
+        is None
+    )
+
+
 def test_balance_reservation_prevents_oversubscription(tmp_path) -> None:
     db = Database(str(tmp_path / "test.db"), default_concurrency=8)
     db.upsert_account(

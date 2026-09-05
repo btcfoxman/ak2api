@@ -10,6 +10,7 @@ Akool 多素材视频生成协议网关。项目以真实 Chrome Profile + CDP �
 - Seedance 2.0 Mini/Fast/标准、Seedance 2.5 Reference、Wan 3.0、Minimax H3。
 - 图片、视频、音频 URL 或 data URL/base64 素材。
 - 视频参考素材可通过运行设置或 `AK_ALLOW_VIDEO_REFERENCE_INPUTS` 统一启用/禁用。
+- 未传图片和视频时自动使用账号级缓存的 1024×1024 纯黑图兼容文生视频；内置黑图不参与提示词素材引用。
 - 每日签到默认开启：维护线程先查询当天签到状态，按需签到并立即刷新账号余额；可通过运行设置或 `AK_DAILY_CHECKIN_ENABLED=false` 关闭。
 - 提交前调用 Akool `calculateFee`，按 `credit - lock_credit` 预扣并发额度。
 - SQLite 任务恢复、账号并发、排队容量、低余额自动禁用。
@@ -67,6 +68,8 @@ Content-Type: application/json
 ```
 
 使用 `GET /v1/videos/{task_id}` 查询。`background=false` 可在同步等待时间内返回最终状态。完整模型能力可通过控制台“接入文档”复制，或调用 `GET /v1/models`。
+
+`image_urls`、`video_urls` 均可省略。无视觉素材时网关会透明补充内置黑图，上游审计中以 `synthetic: text_to_video_black_image` 标记。
 
 ## 安全约束
 

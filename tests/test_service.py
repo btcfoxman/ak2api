@@ -93,6 +93,8 @@ def settings(tmp_path) -> SimpleNamespace:
 
 
 class FakeAkoolClient:
+    default_image_uploads: list[int] = []
+
     def __init__(self, account, settings):
         self.account = dict(account)
         self.settings = settings
@@ -105,6 +107,20 @@ class FakeAkoolClient:
             name=name or kind,
             content_type="application/octet-stream",
             size=100,
+        )
+
+    def upload_default_text_video_image(self):
+        self.default_image_uploads.append(int(self.account["id"]))
+        return MediaUpload(
+            profile_id=f"profile-{self.account['id']}-black",
+            url=f"https://cdn.example.com/{self.account['id']}/black.jpg",
+            kind="image",
+            name="akool-text-to-video-black-1024.jpg",
+            content_type="image/jpeg",
+            size=6365,
+            width=1024,
+            height=1024,
+            synthetic=True,
         )
 
     def build_generation_request(self, payload, uploads):
@@ -351,6 +367,47 @@ def test_account_acquisition_fails_fast_when_all_balances_are_too_low(
         gateway.stop()
 
     assert raised.value.code == "INSUFFICIENT_CREDITS"
+
+
+def test_text_only_tasks_upload_and_reuse_account_black_image(
+    tmp_path, monkeypatch
+) -> None:
+    FakeAkoolClient.default_image_uploads = []
+    monkeypatch.setattr(service_module, "AkoolClient", FakeAkoolClient)
+    db = Database(str(tmp_path / "text-video.db"), default_concurrency=8)
+    account = db.upsert_account(
+        {"name": "ready", "status": "active", "last_balance": 100}
+    )
+    payload = {
+        "kind": "video",
+        "model": "doubao-seedance-2-0-mini-260615",
+        "prompt": "create from text only",
+        "duration": 4,
+        "resolution": "480p",
+        "aspect_ratio": "16:9",
+        "_images": [],
+        "_videos": [],
+        "_audio": [],
+        "_estimated_cost": 0,
+    }
+    db.create_task("gen_text_one", payload)
+    db.create_task("gen_text_two", payload)
+    gateway = AKService(db, settings(tmp_path))
+
+    try:
+        gateway._run_task("gen_text_one")
+        gateway._run_task("gen_text_two")
+    finally:
+        gateway.stop()
+
+    assert FakeAkoolClient.default_image_uploads == [account["id"]]
+    for task_id in ("gen_text_one", "gen_text_two"):
+        task = db.get_task(task_id)
+        assert task["status"] == "succeeded"
+        uploads = (task["upstream_request"] or {}).get("uploads") or []
+        assert uploads[0]["synthetic"] == "text_to_video_black_image"
+        assert uploads[0]["width"] == 1024
+        assert uploads[0]["height"] == 1024
 
 
 def test_task_account_acquisition_avoids_only_active_maintenance(tmp_path) -> None:

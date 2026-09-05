@@ -429,6 +429,7 @@ def integration_docs() -> Response:
 {models_markdown}
 - 渠道最大素材上限：{channel_limits['images']} 图、{channel_limits['videos']} 视频、{channel_limits['audio']} 音频；各模型按上表限制
 - 视频参考策略：{video_policy}
+- 未传入图片或视频时，网关会按账号复用内置 1024×1024 黑图，将文生视频请求转换为上游兼容的图生视频请求；黑图不会写入提示词或 `prompt_info`
 - 默认策略：超出素材数量时忽略多余项；设置中可切换为严格校验
 - 登录与任务协议始终使用账号绑定代理；提交前动态询价并预扣可用积分
 

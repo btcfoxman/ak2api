@@ -30,6 +30,7 @@ from app.akool_client import (
     AkoolClient,
     AkoolRiskBlocked,
     AkoolUpstreamError,
+    MediaUpload,
     failure_reason,
     result_urls,
 )
@@ -43,6 +44,7 @@ from app.model_catalog import (
 
 LOGGER = logging.getLogger("ak2api.service")
 TERMINAL_STATUSES = {"succeeded", "failed", "expired"}
+TEXT_VIDEO_IMAGE_CACHE_KEY = "text_to_video_black_1024_v1"
 PUBLIC_FAILURE = "生成失败，积分已返还，请重试~"
 PUBLIC_MEDIA_FAILURE = "素材下载失败，请检查~"
 PUBLIC_FORMAT_FAILURE = "处理失败，请检查图音视频格式和大小"
@@ -157,6 +159,7 @@ class AKService:
         self._running_maintenance: set[int] = set()
         self._active_maintenance: set[int] = set()
         self._resetting_profiles: set[int] = set()
+        self._text_video_image_locks: dict[int, threading.Lock] = {}
         self._stop = threading.Event()
         self._maintenance_wakeup = threading.Event()
         self._maintenance_thread: threading.Thread | None = None
@@ -907,6 +910,43 @@ class AKService:
         self._mark_account_suspended(account_id)
         self.db.release_account(account_id, task_id=task_id)
 
+    def _text_video_image(
+        self,
+        account: dict[str, Any],
+        client: AkoolClient,
+    ) -> MediaUpload:
+        account_id = int(account["id"])
+        with self._account_guard:
+            lock = self._text_video_image_locks.setdefault(
+                account_id,
+                threading.Lock(),
+            )
+        with lock:
+            cached = self.db.get_account_media_cache(
+                account_id,
+                TEXT_VIDEO_IMAGE_CACHE_KEY,
+            )
+            if cached and cached.get("profile_id") and cached.get("url"):
+                return MediaUpload(
+                    profile_id=str(cached["profile_id"]),
+                    url=str(cached["url"]),
+                    kind="image",
+                    name="akool-text-to-video-black-1024.jpg",
+                    content_type=str(cached.get("content_type") or "image/jpeg"),
+                    size=int(cached.get("size") or 0),
+                    width=int(cached.get("width") or 1024),
+                    height=int(cached.get("height") or 1024),
+                    raw={"_cache_key": TEXT_VIDEO_IMAGE_CACHE_KEY},
+                    synthetic=True,
+                )
+            upload = client.upload_default_text_video_image()
+            self.db.set_account_media_cache(
+                account_id,
+                TEXT_VIDEO_IMAGE_CACHE_KEY,
+                upload.audit_view(),
+            )
+            return upload
+
     def _run_task(self, task_id: str) -> None:
         task = self.db.get_task(task_id)
         if not task or task.get("status") in TERMINAL_STATUSES:
@@ -936,6 +976,9 @@ class AKService:
                 [("image", item) for item in payload.get("_images") or []]
                 + [("video", item) for item in payload.get("_videos") or []]
                 + [("audio", item) for item in payload.get("_audio") or []]
+            )
+            needs_text_video_image = not any(
+                kind in {"image", "video"} for kind, _ in sources
             )
             uploads = []
 
@@ -1002,6 +1045,14 @@ class AKService:
                             ((index + 1) / max(len(sources), 1)) * 25
                         )
                         self.db.update_task(task_id, progress=progress)
+                    if needs_text_video_image:
+                        upload, client = self._with_recovery(
+                            account,
+                            client,
+                            lambda current: self._text_video_image(account, current),
+                        )
+                        uploads.insert(0, upload)
+                        self.db.update_task(task_id, progress=30)
                 except AkoolAccountSuspended as exc:
                     self._release_suspended_account(
                         task_id=task_id,

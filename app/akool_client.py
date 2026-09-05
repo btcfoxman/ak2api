@@ -6,6 +6,7 @@ import mimetypes
 import re
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -76,6 +77,7 @@ class MediaUpload:
     width: int = 0
     height: int = 0
     raw: dict[str, Any] | None = None
+    synthetic: bool = False
 
     def audit_view(self) -> dict[str, Any]:
         result = {
@@ -92,6 +94,8 @@ class MediaUpload:
         adjustment = (self.raw or {}).get("_image_adjustment")
         if isinstance(adjustment, dict) and adjustment:
             result["image_adjustment"] = adjustment
+        if self.synthetic:
+            result["synthetic"] = "text_to_video_black_image"
         return result
 
 
@@ -141,6 +145,19 @@ def _auth_message(value: str) -> bool:
 def _account_suspended_message(value: str) -> bool:
     text = value.lower()
     return "account has been suspended" in text or "account is suspended" in text
+
+
+@lru_cache(maxsize=1)
+def default_text_video_image_source() -> str:
+    buffer = io.BytesIO()
+    Image.new("RGB", (1024, 1024), color=(0, 0, 0)).save(
+        buffer,
+        format="JPEG",
+        quality=95,
+        optimize=True,
+    )
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
 
 
 def result_urls(detail: dict[str, Any]) -> list[str]:
@@ -698,12 +715,23 @@ class AkoolClient:
             raw={**item, "_image_adjustment": image_info} if image_info else item,
         )
 
+    def upload_default_text_video_image(self) -> MediaUpload:
+        upload = self.upload_media(
+            default_text_video_image_source(),
+            "image",
+            "akool-text-to-video-black-1024.jpg",
+        )
+        upload.synthetic = True
+        return upload
+
     @staticmethod
     def _prompt_info(uploads: list[MediaUpload]) -> tuple[list[dict[str, Any]], str]:
         counters = {"image": 0, "video": 0, "audio": 0}
         items: list[dict[str, Any]] = []
         references: list[str] = []
         for upload in uploads:
+            if upload.synthetic:
+                continue
             counters[upload.kind] += 1
             label = {
                 "image": "Image",
@@ -755,10 +783,8 @@ class AkoolClient:
         upstream_model = str(payload.get("upstream_model") or spec.upstream_model)
         request = {
             "prompt": prompt,
-            "prompt_info": prompt_info,
             "negativePrompt": str(payload.get("negative_prompt") or ""),
             "extendPrompt": bool(payload.get("extend_prompt", True)),
-            "audio_type": spec.audio_type,
             "count": 1,
             "resolution": str(payload.get("resolution") or spec.resolutions[0]),
             "modifiers": payload.get("modifiers")
@@ -771,9 +797,13 @@ class AkoolClient:
             ],
             "video_length": int(payload.get("duration") or spec.durations[0]),
             "imageUrl": [item.url for item in images],
-            "reference_audio_urls": [item.url for item in audio],
             "model_name": upstream_model,
         }
+        if prompt_info:
+            request["prompt_info"] = prompt_info
+        if audio:
+            request["audio_type"] = spec.audio_type
+            request["reference_audio_urls"] = [item.url for item in audio]
         ratio = str(payload.get("aspect_ratio") or "adaptive")
         if ratio != "adaptive":
             request["ratio"] = ratio

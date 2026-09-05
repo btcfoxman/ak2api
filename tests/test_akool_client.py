@@ -11,6 +11,7 @@ from app.akool_client import (
     AkoolClient,
     AkoolUpstreamError,
     MediaUpload,
+    default_text_video_image_source,
     result_urls,
 )
 
@@ -95,6 +96,43 @@ def test_prepare_image_preserves_compatible_known_input_unless_forced() -> None:
     assert forced
     assert forced_name == "ready-akool.jpg"
     assert forced_info["reencode_reason"] == "forced_retry"
+
+
+def test_default_text_video_image_is_valid_1024_black_jpeg() -> None:
+    decoded = AkoolClient._decode_data_url(default_text_video_image_source())
+
+    assert decoded is not None
+    data, content_type = decoded
+    with Image.open(io.BytesIO(data)) as image:
+        assert image.size == (1024, 1024)
+        assert image.format == "JPEG"
+        assert image.getpixel((512, 512)) == (0, 0, 0)
+    assert content_type == "image/jpeg"
+
+
+def test_synthetic_black_image_matches_captured_text_video_request() -> None:
+    client = AkoolClient({"cookie_header": "token=test"}, settings())
+    black = upload("image", 1)
+    black.synthetic = True
+
+    request = client.build_generation_request(
+        {
+            "model": "doubao-seedance-2-0-mini-260615",
+            "prompt": "create from text only",
+            "duration": 4,
+            "resolution": "480p",
+            "aspect_ratio": "16:9",
+        },
+        [black],
+    )
+
+    assert request["prompt"] == "create from text only"
+    assert "prompt_info" not in request
+    assert "audio_type" not in request
+    assert "reference_audio_urls" not in request
+    assert request["imageUrl"] == ["https://cdn.example.com/image-1"]
+    assert request["all_in_one_reference"] is True
+    assert request["model_name"] == "doubao-seedance-2-0-mini-260615/image-to-video"
 
 
 def test_generation_request_matches_captured_protocol() -> None:
