@@ -32,7 +32,7 @@ function renderAccounts() {
     const quota = account.balance_details || {};
     const detail = `${account.plan || "-"} · 总额 ${quota.credit ?? "-"} · 锁定 ${quota.lock_credit ?? 0} · 优先级 ${quota.priority ?? "-"}`;
     return `<tr><td><span class="cell-title"><span class="account-id mono">#${account.id}</span>${escapeHtml(account.name)}</span><span class="cell-sub">${escapeHtml(account.email || account.user_id || "")}</span></td>
-      <td>${badge(account.enabled ? account.status : account.status === "disabled_low_balance" ? account.status : "disabled")}<span class="cell-sub" title="${escapeHtml(account.last_error)}">${escapeHtml(account.last_error)}</span></td>
+      <td>${badge(account.enabled ? account.status : ["disabled_low_balance", "suspended"].includes(account.status) ? account.status : "disabled")}<span class="cell-sub" title="${escapeHtml(account.last_error)}">${escapeHtml(account.last_error)}</span></td>
       <td title="${escapeHtml(detail)}"><span class="cell-title mono">${escapeHtml(account.last_balance ?? "-")}</span><span class="cell-sub">${escapeHtml(detail)}</span></td>
       <td><span class="slots ${account.active_tasks ? "busy" : ""}"><i></i><b class="mono">${account.active_tasks || 0} /</b><input class="concurrency-input mono" data-account-concurrency="${account.id}" type="number" min="1" value="${account.max_concurrency}" title="修改账号并发"></span></td><td class="mono">${account.total_uses || 0}</td>
       <td><span class="cell-title mono proxy" title="${escapeHtml(account.proxy_url)}">${escapeHtml(proxyLabel(account.proxy_url))}</span></td><td><span class="cell-title mono">${account.cdp_port || "自动"}</span><span class="cell-sub">${account.auto_login ? "自动重连" : "手动"}</span></td><td>${fmtTime(account.last_checked_at)}</td>
