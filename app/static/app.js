@@ -2,7 +2,7 @@ const state = { accounts: [], tasks: [], models: [], settings: {}, accountFilter
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const terminal = new Set(["succeeded", "failed", "expired"]);
-const publicErrors = { CONTENT_MODERATION_FAILED: "检测到内容有敏感或违规情况，积分已返还，请重试", MEDIA_DOWNLOAD_FAILED: "素材下载失败，请检查~", PROVIDER_INVALID_REQUEST: "处理失败，请检查图音视频格式和大小" };
+const publicErrors = { CONTENT_MODERATION_FAILED: "检测到视频有敏感或违规内容，请修改后重试，积分已返还～", MEDIA_DOWNLOAD_FAILED: "素材下载失败，请检查~", PROVIDER_INVALID_REQUEST: "处理失败，请检查图音视频格式和大小" };
 
 function icons() { if (window.lucide) window.lucide.createIcons(); }
 function escapeHtml(value) { return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char])); }
@@ -22,7 +22,7 @@ function fmtCost(value) { const number = Number(value || 0); return Number.isInt
 function elapsed(task) { const end = Number(task.completed_at || Date.now() / 1000); const total = Math.max(Math.floor(end - Number(task.created_at || end)), 0); return total < 60 ? `${total}秒` : `${Math.floor(total / 60)}分${total % 60}秒`; }
 function badge(status) { const labels = { active: "可用", pending: "待检测", login_pending: "待登录", logging_in: "登录中", login_failed: "登录失败", challenge_required: "需验证", profile_resetting: "重置中", queued: "排队", preparing: "准备", submitted: "已提交", running: "生成中", succeeded: "完成", failed: "失败", expired: "超时", login_required: "需登录", network_error: "网络异常", suspended: "上游封禁", disabled: "禁用", disabled_low_balance: "低额度" }; return `<span class="badge ${escapeHtml(status)}">${escapeHtml(labels[status] || status || "未知")}</span>`; }
 function proxyLabel(value) { try { const url = new URL(value); return `${url.hostname}:${url.port}`; } catch { return value || "直连"; } }
-function failureMessage(task) { if (/content was flagged by our moderation system/i.test(task.error_message || "")) return publicErrors.CONTENT_MODERATION_FAILED; return publicErrors[String(task.error_code || "").toUpperCase()] || "生成失败，积分已返还，请重试~"; }
+function failureMessage(task) { if (/content (?:was flagged by our moderation system|violates safety rules)/i.test(task.error_message || "")) return publicErrors.CONTENT_MODERATION_FAILED; return publicErrors[String(task.error_code || "").toUpperCase()] || "生成失败，积分已返还，请重试~"; }
 
 function renderAccounts() {
   const enabled = state.accounts.filter((item) => item.enabled); const disabled = state.accounts.filter((item) => !item.enabled);

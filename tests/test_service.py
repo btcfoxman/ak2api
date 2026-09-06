@@ -9,7 +9,7 @@ import app.service as service_module
 import pytest
 from app.akool_client import AkoolAccountSuspended, AkoolUpstreamError, MediaUpload
 from app.db import Database
-from app.service import AKService, _DynamicSlots
+from app.service import AKService, PUBLIC_MODERATION_FAILURE, _DynamicSlots
 
 
 def test_dynamic_slots_release_waiters_in_reserved_fifo_order() -> None:
@@ -51,6 +51,20 @@ def test_dynamic_slots_release_waiters_in_reserved_fifo_order() -> None:
 )
 def test_image_constraint_failure_matches_upstream_variants(message) -> None:
     assert service_module._is_image_constraint_failure(message)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Your content was flagged by our moderation system.",
+        "Sorry, the content violates safety rules. Please try a different image or description.",
+    ],
+)
+def test_moderation_failure_matches_upstream_variants(message) -> None:
+    assert service_module._is_moderation_failure(message)
+    assert AKService.public_failure_message(
+        {"error_code": "GENERATION_FAILED", "error_message": message}
+    ) == PUBLIC_MODERATION_FAILURE
 
 
 def settings(tmp_path) -> SimpleNamespace:
