@@ -49,6 +49,7 @@ TERMINAL_STATUSES = {"succeeded", "failed", "expired"}
 TEXT_VIDEO_IMAGE_CACHE_KEY = "text_to_video_black_1024_v1"
 PUBLIC_FAILURE = "生成失败，积分已返还，请重试~"
 PUBLIC_MEDIA_FAILURE = "素材下载失败，请检查~"
+PUBLIC_MEDIA_DURATION_FAILURE = "素材时长不支持，请修改后再试"
 PUBLIC_FORMAT_FAILURE = "处理失败，请检查图音视频格式和大小"
 PUBLIC_MODERATION_FAILURE = "检测到视频有敏感或违规内容，请修改后重试，积分已返还～"
 
@@ -1515,6 +1516,12 @@ class AKService:
             task.get("error_message")
         ):
             return PUBLIC_MODERATION_FAILURE
+        if re.search(
+            r"\bduration\s+must\s+be\s+between\s+\d+(?:\.\d+)?\s*s\s+and\s+\d+(?:\.\d+)?\s*s\b",
+            str(task.get("error_message") or ""),
+            re.I,
+        ):
+            return PUBLIC_MEDIA_DURATION_FAILURE
         if code == "MEDIA_DOWNLOAD_FAILED":
             return PUBLIC_MEDIA_FAILURE
         if code == "PROVIDER_INVALID_REQUEST":
