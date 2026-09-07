@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import base64
 import io
+import math
 import mimetypes
 import re
 import time
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -53,6 +55,18 @@ class AkoolUpstreamError(RuntimeError):
 class AkoolAuthError(AkoolUpstreamError):
     def __init__(self, message: str = "Akool session is invalid"):
         super().__init__(message, code="AKOOL_AUTH_REQUIRED", status_code=401)
+
+
+class AkoolRateLimited(AkoolUpstreamError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after: Any = None,
+        details: Any = None,
+    ):
+        super().__init__(message, code="RATE_LIMITED", status_code=429, details=details)
+        self.retry_after = rate_limit_retry_after(message, retry_after)
 
 
 class AkoolRiskBlocked(AkoolUpstreamError):
@@ -145,6 +159,34 @@ def _auth_message(value: str) -> bool:
 def _account_suspended_message(value: str) -> bool:
     text = value.lower()
     return "account has been suspended" in text or "account is suspended" in text
+
+
+def is_rate_limit_message(value: Any) -> bool:
+    text = str(value or "").lower()
+    return any(
+        marker in text
+        for marker in ("too many requests", "rate limit", "rate_limit", "ratelimit")
+    )
+
+
+def rate_limit_retry_after(message: str, header: Any = None) -> float | None:
+    delays: list[float] = []
+    if header is not None:
+        try:
+            delays.append(float(header))
+        except (TypeError, ValueError):
+            try:
+                delays.append(parsedate_to_datetime(str(header)).timestamp() - time.time())
+            except (TypeError, ValueError, OverflowError):
+                pass
+    match = re.search(
+        r"(?:retry|try again)\s+(?:after|in)\s+(\d+(?:\.\d+)?)\s*(?:seconds?|secs?|s)\b",
+        str(message),
+        re.I,
+    )
+    if match:
+        delays.append(float(match.group(1)))
+    return max((max(delay, 0) for delay in delays if math.isfinite(delay)), default=None)
 
 
 @lru_cache(maxsize=1)
@@ -276,17 +318,20 @@ class AkoolClient:
                 message = _message(body, f"Akool HTTP {response.status_code}")
                 if _account_suspended_message(message):
                     raise AkoolAccountSuspended(message)
+                if (
+                    response.status_code == 429
+                    or (isinstance(body, dict) and body.get("code") in (429, "429"))
+                    or is_rate_limit_message(message)
+                ):
+                    raise AkoolRateLimited(
+                        message,
+                        retry_after=response.headers.get("Retry-After"),
+                        details=body,
+                    )
                 if response.status_code in {401, 419} or _auth_message(message):
                     raise AkoolAuthError(message)
                 if response.status_code == 403 or _risk_message(message):
                     raise AkoolRiskBlocked(message)
-                if response.status_code == 429:
-                    raise AkoolUpstreamError(
-                        message,
-                        code="RATE_LIMITED",
-                        status_code=429,
-                        details=body,
-                    )
                 if response.status_code >= 500:
                     raise AkoolUpstreamError(
                         message,
@@ -329,6 +374,8 @@ class AkoolClient:
         message = _message(body, f"{operation} failed")
         if code in (1108, "1108") or _account_suspended_message(message):
             raise AkoolAccountSuspended(message)
+        if code in (429, "429") or is_rate_limit_message(message):
+            raise AkoolRateLimited(message, details=body)
         if _risk_message(message):
             raise AkoolRiskBlocked(message)
         if _auth_message(message):
@@ -909,6 +956,9 @@ class AkoolClient:
             for item in data.get("result") or []:
                 if isinstance(item, dict) and str(item.get("_id") or "") == str(resource_id):
                     status_value = int(item.get("video_status") or 0)
+                    reason = failure_reason(item)
+                    if status_value != 3 and is_rate_limit_message(reason):
+                        raise AkoolRateLimited(reason, details=item)
                     status = {1: "PENDING", 2: "PROCESSING", 3: "COMPLETE"}.get(
                         status_value,
                         "FAILED"

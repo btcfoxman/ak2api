@@ -32,6 +32,8 @@ from app.akool_client import (
     AkoolUpstreamError,
     MediaUpload,
     failure_reason,
+    is_rate_limit_message,
+    rate_limit_retry_after,
     result_urls,
 )
 from app.model_catalog import (
@@ -780,9 +782,7 @@ class AKService:
     ) -> dict[str, Any]:
         payload = task.get("request") or {}
         recovering = bool(task.get("generation_id"))
-        preferred = payload.get("account_id")
-        if recovering and not preferred:
-            preferred = task.get("account_id")
+        preferred = task.get("account_id") if recovering else payload.get("account_id")
         excluded = {int(value) for value in (exclude_ids or set())}
         if preferred and int(preferred) in excluded:
             preferred = None
@@ -1191,10 +1191,48 @@ class AKService:
                 raise AkoolUpstreamError("no Akool account was selected")
             account_id = int(account["id"])
 
+            poll_errors = 0
             while time.monotonic() < deadline:
-                detail, client = self._with_recovery(
-                    account, client, lambda current: current.generation_detail(generation_id)
-                )
+                try:
+                    detail, client = self._with_recovery(
+                        account, client, lambda current: current.generation_detail(generation_id)
+                    )
+                except AkoolUpstreamError as exc:
+                    if not (
+                        exc.status_code == 429
+                        or exc.code in {"RATE_LIMITED", "NETWORK_ERROR", "AKOOL_HTTP_ERROR"}
+                        or is_rate_limit_message(exc)
+                    ):
+                        raise
+                    poll_errors += 1
+                    retry_after = getattr(exc, "retry_after", None)
+                    if retry_after is None:
+                        retry_after = rate_limit_retry_after(str(exc))
+                    backoff = max(int(self.settings.poll_interval_seconds), 1)
+                    backoff *= 2 ** min(poll_errors - 1, 6)
+                    delay = max(
+                        float(retry_after or 0),
+                        min(backoff, 120),
+                    )
+                    attempts.append(
+                        {
+                            "poll_error": {
+                                "code": exc.code,
+                                "message": str(exc),
+                                "response": exc.details or {},
+                                "retry_after_seconds": delay,
+                            }
+                        }
+                    )
+                    self.db.update_task(
+                        task_id,
+                        status="running",
+                        upstream_response={"attempts": attempts[-30:]},
+                    )
+                    LOGGER.info("task %s polling delayed by %.1fs: %s", task_id, delay, exc)
+                    time.sleep(min(delay, max(deadline - time.monotonic(), 0)))
+                    continue
+                poll_errors = 0
                 status = str(detail.get("status") or "PROCESSING").upper()
                 provider_progress = float(detail.get("progress") or 0)
                 if provider_progress <= 1:
@@ -1436,10 +1474,26 @@ class AKService:
             "error_message": "",
             "completed_at": None,
         }
+        if (
+            task.get("generation_id")
+            and task.get("account_id")
+            and (
+                task.get("error_code") == "RATE_LIMITED"
+                or is_rate_limit_message(task.get("error_message"))
+            )
+        ):
+            changes.update(
+                status="submitted",
+                progress=40,
+                account_id=task["account_id"],
+                generation_id=task["generation_id"],
+            )
         self.db.update_task(
             task_id,
             **changes,
         )
+        if changes["generation_id"]:
+            self.db.acquire_account(task_id=task_id, recovering=True)
         self._schedule(task_id)
         return self.db.get_task(task_id) or {}
 

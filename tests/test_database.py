@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
+
 from app.db import Database
 
 
@@ -120,3 +125,132 @@ def test_account_dispatch_spreads_active_tasks_before_reusing_account(tmp_path) 
     ]
     assert selected[3] is not None
     assert selected[3]["id"] == accounts[0]["id"]
+
+
+@pytest.mark.parametrize("extra", [{}, {"max_concurrency": None}])
+def test_account_sync_keeps_existing_concurrency_when_unspecified(tmp_path, extra) -> None:
+    db = Database(str(tmp_path / "sync.db"), default_concurrency=8)
+    account = db.upsert_account({"name": "one", "email": "user@example.com", "max_concurrency": 2})
+
+    synced = db.upsert_account({"name": "synced", "email": "user@example.com", "cookie_header": "session=test", **extra})
+    assert synced["id"] == account["id"]
+    assert synced["max_concurrency"] == 2
+
+    changed = db.upsert_account({"name": "one", "max_concurrency": 3})
+    assert changed["max_concurrency"] == 3
+
+
+def test_parallel_account_acquisition_respects_limit_across_database_instances(tmp_path) -> None:
+    databases = [Database(str(tmp_path / "parallel.db")) for _ in range(8)]
+    db = databases[0]
+    account = db.upsert_account({"name": "one", "status": "active", "max_concurrency": 2})
+    for index in range(8):
+        db.create_task(str(index), {"kind": "video", "model": "test"})
+    barrier = threading.Barrier(8)
+
+    def acquire(index):
+        barrier.wait(timeout=5)
+        return databases[index].acquire_account(task_id=str(index))
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(acquire, range(8)))
+
+    assert sum(result is not None for result in results) == 2
+    assert db.get_account(account["id"])["active_tasks"] == 2
+
+
+def test_slot_acquisition_and_release_are_idempotent_per_task(tmp_path) -> None:
+    db = Database(str(tmp_path / "slots.db"))
+    account = db.upsert_account({"name": "one", "status": "active", "last_balance": 100, "max_concurrency": 2})
+    other = db.upsert_account({"name": "other", "status": "active"})
+    for task_id in ("one", "two", "three", "four"):
+        db.create_task(task_id, {"kind": "video", "model": "test"})
+    for task_id in ("one", "two"):
+        assert db.acquire_account(account["id"], task_id=task_id, reservation_cost=4)
+
+    assert db.acquire_account(account["id"], task_id="one")
+    assert db.get_account(account["id"])["active_tasks"] == 2
+    assert db.get_account(account["id"])["reserved_balance"] == 8
+    db.release_account(other["id"], task_id="two")
+    assert db.get_account(account["id"])["reserved_balance"] == 8
+    db.release_account(account["id"], task_id="one")
+    db.release_account(account["id"], task_id="one")
+    assert db.get_account(account["id"])["active_tasks"] == 1
+    assert db.acquire_account(account["id"], task_id="three")
+    assert db.acquire_account(account["id"], task_id="four") is None
+
+
+def test_restart_reserves_submitted_tasks_before_dispatch_and_recovers_original_account(tmp_path) -> None:
+    path = str(tmp_path / "restart.db")
+    db = Database(path)
+    account = db.upsert_account({"name": "one", "status": "active", "last_balance": 100, "max_concurrency": 1})
+    other = db.upsert_account({"name": "other", "status": "active"})
+    for task_id in ("queued", "submitted"):
+        db.create_task(task_id, {"kind": "video", "model": "test"})
+    assert db.acquire_account(account["id"], task_id="submitted", reservation_cost=4)
+    db.update_task("submitted", generation_id="upstream-existing", status="running")
+
+    restarted = Database(path)
+
+    assert restarted.get_account(account["id"])["active_tasks"] == 1
+    assert restarted.get_account(account["id"])["reserved_balance"] == 4
+    assert restarted.acquire_account(account["id"], task_id="queued") is None
+    assert [task["id"] for task in restarted.recoverable_tasks()] == ["submitted", "queued"]
+    restarted.update_account(account["id"], {"enabled": False})
+    recovered = restarted.acquire_account(other["id"], task_id="submitted", recovering=True)
+    assert recovered["id"] == account["id"]
+    assert recovered["active_tasks"] == 1
+    assert recovered["total_uses"] == 1
+    restarted.release_account(account["id"], task_id="submitted")
+    assert restarted.get_account(account["id"])["active_tasks"] == 0
+
+
+def test_legacy_database_migration_restores_running_slots_without_reserving_finished_tasks(tmp_path) -> None:
+    path = str(tmp_path / "legacy.db")
+    db = Database(path)
+    account = db.upsert_account({"name": "one", "status": "active", "max_concurrency": 1})
+    for task_id in ("running", "finished", "queued"):
+        db.create_task(task_id, {"kind": "video", "model": "test"})
+    db.update_task("running", account_id=account["id"], generation_id="resource-running", status="running")
+    db.update_task("finished", account_id=account["id"], generation_id="resource-finished", status="succeeded")
+    with db.connect() as connection:
+        connection.execute("DROP INDEX idx_ak_tasks_account_slot")
+        connection.execute("ALTER TABLE tasks DROP COLUMN account_slot_acquired")
+
+    migrated = Database(path)
+
+    assert migrated.get_account(account["id"])["active_tasks"] == 1
+    assert migrated.acquire_account(task_id="queued") is None
+    assert migrated.acquire_account(task_id="running", recovering=True)["active_tasks"] == 1
+    assert migrated.clear_finished_tasks() == 1
+    assert migrated.get_task("running") is not None
+
+
+def test_lowered_concurrency_blocks_new_tasks_until_existing_tasks_drain(tmp_path) -> None:
+    db = Database(str(tmp_path / "lower-limit.db"))
+    account = db.upsert_account({"name": "one", "status": "active", "max_concurrency": 2})
+    for task_id in ("first", "second", "queued"):
+        db.create_task(task_id, {"kind": "video", "model": "test"})
+    assert db.acquire_account(task_id="first")
+    assert db.acquire_account(task_id="second")
+
+    db.update_account(account["id"], {"max_concurrency": 1})
+
+    assert db.acquire_account(task_id="queued") is None
+    db.release_account(account["id"], task_id="first")
+    assert db.acquire_account(task_id="queued") is None
+    db.release_account(account["id"], task_id="second")
+    assert db.acquire_account(task_id="queued")
+
+
+def test_clear_finished_tasks_waits_for_account_slot_release(tmp_path) -> None:
+    db = Database(str(tmp_path / "clear.db"))
+    account = db.upsert_account({"name": "one", "status": "active"})
+    db.create_task("finished", {"kind": "video", "model": "test"})
+    assert db.acquire_account(task_id="finished")
+    db.update_task("finished", status="succeeded")
+
+    assert db.clear_finished_tasks() == 0
+    db.release_account(account["id"], task_id="finished")
+    assert db.clear_finished_tasks() == 1
+    assert db.get_account(account["id"])["active_tasks"] == 0

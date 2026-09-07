@@ -6,12 +6,15 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 
+import app.akool_client as client_module
 from app.akool_client import (
     AkoolAccountSuspended,
     AkoolClient,
+    AkoolRateLimited,
     AkoolUpstreamError,
     MediaUpload,
     default_text_video_image_source,
+    rate_limit_retry_after,
     result_urls,
 )
 
@@ -397,6 +400,117 @@ def test_generation_status_four_is_failed_with_upstream_reason(monkeypatch) -> N
     assert detail["status"] == "FAILED"
     assert detail["providerStatus"] == 4
     assert detail["error"] == "Request failed. Please check your network and try again."
+
+
+@pytest.mark.parametrize(
+    "status_code,body,header,delay",
+    [
+        (429, {"message": "slow down"}, "30", 30),
+        (200, {"code": 429, "msg": "slow down"}, "35", 35),
+        (200, {"code": 1002, "msg": "Too many requests from your IP, please retry after 28 seconds"}, None, 28),
+        (403, {"message": "Too many requests from your IP, please retry after 28 seconds"}, "40", 40),
+    ],
+)
+def test_poll_http_and_business_rate_limits_preserve_retry_delay(
+    monkeypatch, status_code, body, header, delay
+) -> None:
+    client = AkoolClient({}, settings())
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url))
+        return SimpleNamespace(
+            status_code=status_code,
+            headers={"Retry-After": header},
+            json=lambda: body,
+        )
+
+    monkeypatch.setattr(client.session, "request", request)
+
+    with pytest.raises(AkoolRateLimited) as raised:
+        client.generation_detail("resource-running")
+
+    assert raised.value.code == "RATE_LIMITED"
+    assert raised.value.status_code == 429
+    assert raised.value.retry_after == delay
+    assert raised.value.details == body
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("code", [429, "429", 1002])
+def test_require_ok_recognizes_business_rate_limit(code) -> None:
+    with pytest.raises(AkoolRateLimited) as raised:
+        AkoolClient._require_ok(
+            {"code": code, "msg": "Too many requests from your IP, please retry after 28 seconds"},
+            "task list",
+        )
+
+    assert raised.value.retry_after == 28
+
+
+def test_retry_after_supports_http_date_and_ignores_invalid_values(monkeypatch) -> None:
+    monkeypatch.setattr(client_module.time, "time", lambda: 1_000_000_000)
+
+    assert rate_limit_retry_after("slow down", "Sun, 09 Sep 2001 01:47:20 GMT") == 40
+    for header in (None, "invalid", "nan", "inf", "-1"):
+        assert rate_limit_retry_after("Please retry after 28 seconds", header) == 28
+    assert rate_limit_retry_after("slow down", "invalid") is None
+
+
+@pytest.mark.parametrize("status", [0, 1, 2, 4])
+def test_rate_limit_in_task_detail_is_not_generation_failure(monkeypatch, status) -> None:
+    client = AkoolClient({}, settings())
+    item = {
+        "_id": "resource-running",
+        "video_status": status,
+        "error_reason": "Too many requests from your IP, please retry after 28 seconds",
+    }
+    body = {"code": 1000, "data": {"result": [item]}}
+    monkeypatch.setattr(client, "_request", lambda *args, **kwargs: (body, object()))
+
+    with pytest.raises(AkoolRateLimited) as raised:
+        client.generation_detail("resource-running")
+
+    assert raised.value.retry_after == 28
+    assert raised.value.details == item
+
+
+def test_completed_task_ignores_old_rate_limit_message(monkeypatch) -> None:
+    client = AkoolClient({}, settings())
+    item = {
+        "_id": "resource-complete",
+        "video_status": 3,
+        "error_reason": "Too many requests from your IP, please retry after 28 seconds",
+        "external_video": "https://cdn.example.com/result.mp4",
+    }
+    body = {"code": 1000, "data": {"result": [item]}}
+    monkeypatch.setattr(client, "_request", lambda *args, **kwargs: (body, object()))
+
+    detail = client.generation_detail("resource-complete")
+
+    assert detail["status"] == "COMPLETE"
+    assert detail["urls"] == [item["external_video"]]
+
+
+def test_submit_is_not_replayed_on_rate_limit(monkeypatch) -> None:
+    client = AkoolClient({}, settings())
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url))
+        return SimpleNamespace(
+            status_code=429,
+            headers={"Retry-After": "28"},
+            json=lambda: {"message": "Too many requests from your IP"},
+        )
+
+    monkeypatch.setattr(client.session, "request", request)
+
+    with pytest.raises(AkoolRateLimited):
+        client.generate({"prompt": "test"})
+
+    assert len(calls) == 1
+    assert calls[0][0] == "POST"
 
 
 def test_daily_checkin_matches_captured_status_then_submit_protocol(monkeypatch) -> None:

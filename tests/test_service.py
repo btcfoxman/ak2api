@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import app.service as service_module
 import pytest
-from app.akool_client import AkoolAccountSuspended, AkoolUpstreamError, MediaUpload
+from app.akool_client import AkoolAccountSuspended, AkoolRateLimited, AkoolUpstreamError, MediaUpload
 from app.db import Database
 from app.service import AKService, PUBLIC_MODERATION_FAILURE, _DynamicSlots
 
@@ -354,6 +354,187 @@ def test_task_uses_dynamic_fee_and_refreshes_balance(tmp_path, monkeypatch) -> N
     assert task["result_urls"] == ["https://cdn.example.com/result.mp4"]
     assert refreshed["last_balance"] == 96
     assert refreshed["active_tasks"] == 0
+
+
+@pytest.mark.parametrize(
+    "error,delays",
+    [
+        (AkoolRateLimited("Too many requests from your IP, please retry after 28 seconds"), [28, 28, 28]),
+        (AkoolRateLimited("Too many requests", retry_after="35"), [35, 35, 35]),
+        (AkoolUpstreamError("Too many requests from your IP, please retry after 28 seconds", code="PROVIDER_INVALID_REQUEST", status_code=422), [28, 28, 28]),
+        (AkoolUpstreamError("temporarily unavailable", code="RATE_LIMITED", status_code=429), [2, 4, 8]),
+        (AkoolUpstreamError("connection reset", code="NETWORK_ERROR"), [2, 4, 8]),
+        (AkoolUpstreamError("service unavailable", code="AKOOL_HTTP_ERROR"), [2, 4, 8]),
+    ],
+)
+def test_transient_poll_errors_keep_account_slot_until_original_task_completes(
+    tmp_path, monkeypatch, error, delays
+) -> None:
+    db = Database(str(tmp_path / "poll-retry.db"))
+    account = db.upsert_account({"name": "one", "status": "active", "last_balance": 100, "max_concurrency": 1})
+    payload = {"kind": "video", "model": "doubao-seedance-2-0-mini-260615", "prompt": "test"}
+    db.create_task("running", payload)
+    db.create_task("waiting", payload)
+    polls = []
+    submissions = []
+    balance_checks = []
+    sleeps = []
+    clock = [0.0]
+
+    class LimitedClient(FakeAkoolClient):
+        def generate(self, request):
+            submissions.append(request)
+            return super().generate(request)
+
+        def generation_detail(self, generation_id):
+            polls.append(generation_id)
+            if len(polls) <= 3:
+                raise error
+            return super().generation_detail(generation_id)
+
+        def account_state(self):
+            balance_checks.append(self.account["id"])
+            return super().account_state()
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+        current = db.get_task("running")
+        assert current["status"] == "running"
+        assert current["generation_id"] == "resource-test"
+        assert current["completed_at"] is None
+        assert current["progress"] < 100
+        assert current["error_code"] == ""
+        assert db.get_account(account["id"])["active_tasks"] == 1
+        assert db.get_account(account["id"])["reserved_balance"] == 4
+        assert db.acquire_account(task_id="waiting") is None
+
+    monkeypatch.setattr(service_module, "AkoolClient", LimitedClient)
+    monkeypatch.setattr(service_module, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep))
+    config = settings(tmp_path)
+    config.task_timeout_seconds = 180
+    gateway = AKService(db, config)
+    try:
+        gateway._run_task("running")
+    finally:
+        gateway.stop()
+
+    task = db.get_task("running")
+    assert task["status"] == "succeeded"
+    assert task["error_code"] == ""
+    assert sleeps == delays
+    assert polls == ["resource-test"] * 4
+    assert len(submissions) == 1
+    assert balance_checks == [account["id"]]
+    assert len([item for item in task["upstream_response"]["attempts"] if "poll_error" in item]) == 3
+    assert db.get_account(account["id"])["active_tasks"] == 0
+    assert db.get_account(account["id"])["reserved_balance"] == 0
+    assert db.acquire_account(task_id="waiting")
+
+
+def test_rate_limit_wait_is_bounded_by_task_timeout(tmp_path, monkeypatch) -> None:
+    db = Database(str(tmp_path / "poll-timeout.db"))
+    account = db.upsert_account({"name": "one", "status": "active", "last_balance": 100, "max_concurrency": 1})
+    db.create_task("running", {"kind": "video", "model": "doubao-seedance-2-0-mini-260615", "prompt": "test"})
+    clock = [0.0]
+    polls = []
+    sleeps = []
+
+    class LimitedClient(FakeAkoolClient):
+        def generation_detail(self, generation_id):
+            polls.append(generation_id)
+            raise AkoolRateLimited("Too many requests from your IP, please retry after 28 seconds")
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(service_module, "AkoolClient", LimitedClient)
+    monkeypatch.setattr(service_module, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=sleep))
+    config = settings(tmp_path)
+    config.task_timeout_seconds = 5
+    gateway = AKService(db, config)
+    try:
+        gateway._run_task("running")
+    finally:
+        gateway.stop()
+
+    task = db.get_task("running")
+    assert task["status"] == "expired"
+    assert task["error_code"] == "TASK_TIMEOUT"
+    assert sleeps == [5]
+    assert polls == ["resource-test"]
+    assert db.get_account(account["id"])["active_tasks"] == 0
+
+
+def test_real_generation_failure_is_still_terminal(tmp_path, monkeypatch) -> None:
+    db = Database(str(tmp_path / "generation-failure.db"))
+    account = db.upsert_account({"name": "one", "status": "active", "last_balance": 100})
+    db.create_task("failed", {"kind": "video", "model": "doubao-seedance-2-0-mini-260615", "prompt": "test"})
+
+    class FailedClient(FakeAkoolClient):
+        def generation_detail(self, generation_id):
+            return {"status": "FAILED", "error": "The model could not generate this video"}
+
+    monkeypatch.setattr(service_module, "AkoolClient", FailedClient)
+    gateway = AKService(db, settings(tmp_path))
+    try:
+        gateway._run_task("failed")
+    finally:
+        gateway.stop()
+
+    task = db.get_task("failed")
+    assert task["status"] == "failed"
+    assert task["error_code"] == "GENERATION_FAILED"
+    assert db.get_account(account["id"])["active_tasks"] == 0
+
+
+@pytest.mark.parametrize("error_code", ["RATE_LIMITED", "PROVIDER_INVALID_REQUEST", "GENERATION_FAILED"])
+def test_retry_of_rate_limited_task_resumes_original_generation_and_account(
+    tmp_path, monkeypatch, error_code
+) -> None:
+    db = Database(str(tmp_path / "resume.db"))
+    requested = db.upsert_account({"name": "requested", "status": "active", "last_balance": 100})
+    actual = db.upsert_account({"name": "actual", "status": "active", "last_balance": 100, "max_concurrency": 1})
+    payload = {"kind": "video", "model": "doubao-seedance-2-0-mini-260615", "prompt": "test", "account_id": requested["id"]}
+    db.create_task("old", payload)
+    db.update_task(
+        "old", status="failed", progress=100, account_id=actual["id"],
+        generation_id="original-resource", estimated_cost=4, error_code=error_code,
+        error_message="Too many requests from your IP, please retry after 28 seconds",
+        completed_at=1,
+    )
+    polls = []
+
+    class ResumeClient(FakeAkoolClient):
+        def generate(self, request):
+            raise AssertionError("a submitted task must not be submitted again")
+
+        def generation_detail(self, generation_id):
+            polls.append((self.account["id"], generation_id))
+            return super().generation_detail(generation_id)
+
+    monkeypatch.setattr(service_module, "AkoolClient", ResumeClient)
+    gateway = AKService(db, settings(tmp_path))
+    scheduled = []
+    monkeypatch.setattr(gateway, "_schedule", scheduled.append)
+    try:
+        retried = gateway.retry_task("old")
+        assert retried["status"] == "submitted"
+        assert retried["generation_id"] == "original-resource"
+        assert retried["completed_at"] is None
+        assert retried["error_code"] == ""
+        assert db.get_account(actual["id"])["active_tasks"] == 1
+        assert db.get_account(actual["id"])["reserved_balance"] == 4
+        gateway._run_task("old")
+    finally:
+        gateway.stop()
+
+    assert scheduled == ["old"]
+    assert db.get_task("old")["status"] == "succeeded"
+    assert polls == [(actual["id"], "original-resource")]
+    assert db.get_account(actual["id"])["active_tasks"] == 0
+    assert db.get_account(requested["id"])["total_uses"] == 0
 
 
 def test_account_acquisition_fails_fast_when_all_balances_are_too_low(

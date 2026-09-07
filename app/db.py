@@ -233,6 +233,7 @@ class Database:
                     progress INTEGER NOT NULL DEFAULT 0,
                     channel TEXT NOT NULL DEFAULT '',
                     account_id INTEGER,
+                    account_slot_acquired INTEGER NOT NULL DEFAULT 0,
                     generation_id TEXT NOT NULL DEFAULT '',
                     result_urls_json TEXT NOT NULL DEFAULT '[]',
                     thumbnail_url TEXT NOT NULL DEFAULT '',
@@ -307,6 +308,7 @@ class Database:
                 ("estimated_cost", "REAL NOT NULL DEFAULT 0"),
                 ("reserved_cost", "REAL NOT NULL DEFAULT 0"),
                 ("actual_cost", "REAL"),
+                ("account_slot_acquired", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if column not in task_columns:
                     connection.execute(
@@ -319,13 +321,38 @@ class Database:
                 WHERE reserved_cost > 0
                 """
             )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_ak_tasks_account_slot
+                ON tasks(account_id)
+                WHERE account_slot_acquired = 1
+                """
+            )
             self._ensure_model_cost_schema(connection)
             connection.execute(
-                "UPDATE accounts SET active_tasks = 0, updated_at = ?",
-                (now_ts(),),
+                """
+                UPDATE tasks
+                SET account_slot_acquired = CASE
+                    WHEN account_id IS NOT NULL
+                      AND status IN ('queued', 'preparing', 'submitted', 'running')
+                      AND (account_slot_acquired = 1 OR generation_id != '')
+                    THEN 1 ELSE 0
+                END
+                """
             )
             connection.execute(
-                "UPDATE tasks SET reserved_cost = 0 WHERE reserved_cost != 0"
+                "UPDATE tasks SET reserved_cost = 0 WHERE account_slot_acquired = 0"
+            )
+            connection.execute(
+                """
+                UPDATE accounts
+                SET active_tasks = (
+                    SELECT COUNT(*) FROM tasks
+                    WHERE tasks.account_id = accounts.id
+                      AND tasks.account_slot_acquired = 1
+                ), updated_at = ?
+                """,
+                (now_ts(),),
             )
             self._normalize_model_cost_resolutions(connection)
             self._backfill_model_cost_records(connection)
@@ -390,6 +417,8 @@ class Database:
             existing = self._find_account_row(connection, values)
             if existing is not None:
                 values["name"] = str(existing["name"])
+                if payload.get("max_concurrency") is None:
+                    values["max_concurrency"] = int(existing["max_concurrency"])
             connection.execute(
                 """
                 INSERT INTO accounts (
@@ -892,6 +921,40 @@ class Database:
         reservation_cost = max(float(reservation_cost or 0), 0)
         with self._lock, self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if task_id:
+                task = connection.execute(
+                    "SELECT * FROM tasks WHERE id = ?", (str(task_id),)
+                ).fetchone()
+                if task is None:
+                    raise ValueError("task not found while reserving account balance")
+                if task["status"] in {"succeeded", "failed", "expired"}:
+                    raise ValueError("cannot acquire an account for a finished task")
+                if task["account_slot_acquired"] or (recovering and task["generation_id"]):
+                    # A submitted task already occupies its original upstream account,
+                    # even if the limit was lowered or the account was disabled later.
+                    account_id = task["account_id"]
+                    if account_id is None:
+                        raise ValueError("the task's original Akool account is missing")
+                    if not task["account_slot_acquired"]:
+                        connection.execute(
+                            """
+                            UPDATE tasks
+                            SET account_slot_acquired = 1,
+                                reserved_cost = MAX(reserved_cost, estimated_cost, 0),
+                                updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (now_ts(), str(task_id)),
+                        )
+                        connection.execute(
+                            """
+                            UPDATE accounts SET active_tasks = active_tasks + 1,
+                                updated_at = ? WHERE id = ?
+                            """,
+                            (now_ts(), int(account_id)),
+                        )
+                    connection.commit()
+                    return self.get_account(int(account_id), include_secrets=True)
             parameters: list[Any] = []
             eligibility_clause = (
                 "candidate.enabled = 1 "
@@ -997,7 +1060,8 @@ class Database:
                 cursor = connection.execute(
                     """
                     UPDATE tasks
-                    SET account_id = ?, reserved_cost = ?, updated_at = ?
+                    SET account_id = ?, reserved_cost = ?, account_slot_acquired = 1,
+                        updated_at = ?
                     WHERE id = ?
                     """,
                     (int(row["id"]), reservation_cost, now, str(task_id)),
@@ -1022,14 +1086,16 @@ class Database:
     def release_account(self, account_id: int, *, task_id: str | None = None) -> None:
         with self._lock, self.connect() as connection:
             if task_id:
-                connection.execute(
+                cursor = connection.execute(
                     """
                     UPDATE tasks
-                    SET reserved_cost = 0, updated_at = ?
-                    WHERE id = ?
+                    SET reserved_cost = 0, account_slot_acquired = 0, updated_at = ?
+                    WHERE id = ? AND account_id = ? AND account_slot_acquired = 1
                     """,
-                    (now_ts(), str(task_id)),
+                    (now_ts(), str(task_id), int(account_id)),
                 )
+                if cursor.rowcount != 1:
+                    return
             connection.execute(
                 """
                 UPDATE accounts
@@ -1302,7 +1368,10 @@ class Database:
                 WHERE status IN (
                     'queued', 'preparing', 'submitted', 'running'
                 )
-                ORDER BY created_at ASC, rowid ASC
+                ORDER BY
+                    CASE WHEN generation_id != '' THEN 0
+                         WHEN account_slot_acquired = 1 THEN 1 ELSE 2 END,
+                    created_at ASC, rowid ASC
                 """
             ).fetchall()
         return [
@@ -1315,6 +1384,7 @@ class Database:
                 """
                 DELETE FROM tasks
                 WHERE status IN ('succeeded', 'failed', 'expired')
+                  AND account_slot_acquired = 0
                 """
             )
         return int(cursor.rowcount or 0)
