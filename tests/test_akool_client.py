@@ -166,13 +166,14 @@ def test_generation_request_matches_captured_protocol() -> None:
     assert "ratio" not in request
 
 
-def test_wan_30_request_matches_captured_protocol() -> None:
+@pytest.mark.parametrize("duration", [10, 16, 30])
+def test_wan_30_request_matches_captured_protocol(duration: int) -> None:
     client = AkoolClient({"cookie_header": "token=test"}, settings())
     request = client.build_generation_request(
         {
             "model": "wan-3.0",
             "prompt": "animate all references",
-            "duration": 10,
+            "duration": duration,
             "resolution": "720P",
             "aspect_ratio": "9:16",
         },
@@ -180,6 +181,7 @@ def test_wan_30_request_matches_captured_protocol() -> None:
     )
 
     assert request["model_name"] == "alibaba/wan-3.0/image-to-video"
+    assert request["video_length"] == duration
     assert request["audio_type"] == 1
     assert request["ratio"] == "9:16"
     assert request["all_in_one_reference"] is True

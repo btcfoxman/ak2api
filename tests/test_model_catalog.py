@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.model_catalog import normalize_generation_request
+from app.model_catalog import normalize_generation_request, public_models
 from app.schemas import GenerationTaskCreate
 
 
@@ -83,6 +83,33 @@ def test_wan_30_uses_captured_resolution_casing() -> None:
     assert result["resolution"] == "720P"
     assert result["generate_audio"] is True
     assert result["all_in_one_reference"] is True
+
+
+@pytest.mark.parametrize("duration", [4, 15, 16, 30])
+@pytest.mark.parametrize("model", ["wan-3.0", "alibaba/wan-3.0/image-to-video"])
+def test_wan_30_accepts_supported_output_durations(model: str, duration: int) -> None:
+    request = GenerationTaskCreate(
+        model=model, prompt="animate", duration=duration
+    ).model_dump(exclude_none=True)
+
+    result = normalize_generation_request(request)
+
+    assert result["model"] == "wan-3.0"
+    assert result["duration"] == duration
+
+
+@pytest.mark.parametrize("duration", [3, 31])
+def test_wan_30_rejects_unsupported_output_durations(duration: int) -> None:
+    with pytest.raises(ValueError, match="wan-3.0 duration must be one of"):
+        normalize_generation_request(
+            {"model": "wan-3.0", "prompt": "animate", "duration": duration}
+        )
+
+
+def test_public_wan_30_capabilities_include_long_output_durations() -> None:
+    model = next(item for item in public_models() if item["id"] == "wan-3.0")
+
+    assert model["capabilities"]["durations"] == list(range(4, 31))
 
 
 def test_sd_aliases_map_to_captured_seedance_models() -> None:
