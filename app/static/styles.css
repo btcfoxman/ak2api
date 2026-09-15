@@ -14,6 +14,32 @@
   --shadow: 0 18px 55px rgba(0, 0, 0, .42);
 }
 
+.icon-button.needs-verification { color: var(--yellow); border-color: var(--yellow); }
+.browser-assist-dialog { width: min(1180px, calc(100vw - 32px)); max-width: none; padding: 0; overflow: hidden; }
+.browser-assist-header, .browser-assist-footer { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 18px 24px; }
+.browser-assist-header { border-bottom: 1px solid var(--line); }
+.browser-assist-header h2 { margin: 4px 0 0; font-size: 20px; }
+.browser-assist-header h2 span { color: var(--muted); margin-left: 8px; font-weight: 400; }
+.browser-assist-guide { display: flex; align-items: center; gap: 10px; padding: 8px 24px; background: var(--surface-2); }
+.browser-assist-guide p { flex: 1; margin: 6px 0; font-size: 12px; }
+.browser-live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 0 4px #55d7ad16; flex-shrink: 0; }
+.browser-assist-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 24px; }
+.browser-assist-toolbar p, .browser-assist-footer > span { margin: 0; color: var(--muted); font-size: 12px; }
+.browser-assist-viewport { background: #080a0b; max-height: 62vh; overflow: auto; min-height: 180px; border-block: 1px solid var(--line); }
+.browser-assist-viewport > p { padding: 60px 24px; text-align: center; color: var(--muted); }
+.browser-assist-viewport img { display: block; width: 100%; height: auto; cursor: crosshair; user-select: none; }
+.browser-assist-viewport.busy img { cursor: progress; pointer-events: none; }
+.browser-assist-footer { background: var(--surface); }
+@media (max-width: 700px) {
+  .browser-assist-dialog { width: calc(100vw - 16px); }
+  .browser-assist-header, .browser-assist-footer { padding: 14px; }
+  .browser-assist-guide { padding: 8px 14px; }
+  .browser-assist-guide .caption { display: none; }
+  .browser-assist-toolbar { padding: 12px 14px; flex-wrap: wrap; }
+  .browser-assist-footer { align-items: stretch; flex-direction: column; }
+  .browser-assist-footer .section-actions { justify-content: flex-end; }
+}
+
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 html { min-width: 320px; background: var(--bg); }

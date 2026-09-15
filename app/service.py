@@ -11,6 +11,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from app.browser_assist import browser_action, browser_snapshot, capture_browser_session
 from app.browser_context import (
     AkoolBrowserAccountSuspended,
     AkoolBrowserChallengeError,
@@ -168,6 +169,7 @@ class AKService:
         self._running_maintenance: set[int] = set()
         self._active_maintenance: set[int] = set()
         self._resetting_profiles: set[int] = set()
+        self._manual_browser_leases: dict[int, float] = {}
         self._text_video_image_locks: dict[int, threading.Lock] = {}
         self._stop = threading.Event()
         self._maintenance_wakeup = threading.Event()
@@ -483,6 +485,8 @@ class AKService:
         if int(account.get("active_tasks") or 0):
             raise ValueError("account has active tasks")
         with self._account_guard:
+            if self._manual_browser_active(account_id):
+                raise ValueError("请先关闭该账号的人工验证窗口")
             if int(account_id) in self._running_logins:
                 raise ValueError("account login is in progress")
             if int(account_id) in self._running_maintenance:
@@ -507,6 +511,8 @@ class AKService:
                 raise KeyError("account not found")
             if int(account.get("active_tasks") or 0):
                 raise ValueError("account has active tasks")
+            if self._manual_browser_active(account_id):
+                raise ValueError("请先关闭该账号的人工验证窗口")
             if account_id in self._running_logins:
                 raise ValueError("account login is already in progress")
             if account_id in self._running_maintenance:
@@ -561,15 +567,68 @@ class AKService:
             "login_started": login_started,
         }
 
+    def _manual_browser_active(self, account_id: int) -> bool:
+        with self._account_guard:
+            deadline = self._manual_browser_leases.get(int(account_id), 0)
+            if deadline > time.monotonic():
+                return True
+            self._manual_browser_leases.pop(int(account_id), None)
+            return False
+
+    def open_manual_browser(self, account_id: int) -> dict[str, Any]:
+        with self._account_guard:
+            account = self.db.get_account(account_id)
+            if not account:
+                raise KeyError("account not found")
+            if account_id in self._running_logins:
+                raise ValueError("登录仍在进行，出现需验证或登录结束后可打开人工验证")
+            if (account_id in self._running_maintenance or account_id in self._resetting_profiles
+                    or account.get("active_tasks")):
+                raise ValueError("账号正在执行任务或维护，请稍后打开人工验证")
+            self._manual_browser_leases[account_id] = time.monotonic() + 120
+        try:
+            return browser_snapshot(account, self.settings, start=True)
+        except Exception:
+            self.close_manual_browser(account_id)
+            raise
+
+    def _manual_browser_account(self, account_id: int) -> dict[str, Any]:
+        with self._account_guard:
+            if not self._manual_browser_active(account_id):
+                raise ValueError("人工验证窗口已关闭或超时，请重新打开")
+            account = self.db.get_account(account_id)
+            if not account:
+                raise KeyError("account not found")
+            self._manual_browser_leases[account_id] = time.monotonic() + 120
+            return account
+
+    def manual_browser_snapshot(self, account_id: int) -> dict[str, Any]:
+        return browser_snapshot(self._manual_browser_account(account_id), self.settings)
+
+    def manual_browser_action(self, account_id: int, action: dict[str, Any]) -> dict[str, Any]:
+        return browser_action(self._manual_browser_account(account_id), self.settings, action)
+
+    def complete_manual_browser(self, account_id: int) -> dict[str, Any]:
+        account = self._manual_browser_account(account_id)
+        context = capture_browser_session(account, self.settings)
+        self.db.update_account(account_id, context)
+        result = self.check_account(account_id, recover=False)
+        self.close_manual_browser(account_id)
+        return result
+
+    def close_manual_browser(self, account_id: int) -> None:
+        with self._account_guard:
+            self._manual_browser_leases.pop(account_id, None)
+
     def schedule_login(self, account_id: int) -> bool:
         account_id = int(account_id)
         with self._account_guard:
-            if account_id in self._running_logins:
+            if account_id in self._running_logins or self._manual_browser_active(account_id):
                 return False
             if not self.db.get_account(account_id, include_secrets=False):
                 return False
             self._running_logins.add(account_id)
-            self.db.update_account(account_id, {"status": "logging_in", "last_error": ""})
+            self.db.update_account(account_id, {"status": "login_pending", "last_error": ""})
             try:
                 future = self._logins.submit(self._login_account, account_id)
             except Exception:
@@ -591,6 +650,7 @@ class AKService:
             account = self.db.get_account(account_id)
             if not account:
                 raise KeyError("account not found")
+            self.db.update_account(account_id, {"status": "logging_in", "last_error": ""})
             context = refresh_account_context(account, self.settings)
             self.db.update_account(account_id, context)
             return self.check_account(account_id, recover=False)
@@ -617,6 +677,8 @@ class AKService:
             self._login_slots.release()
 
     def _recover_client(self, account: dict[str, Any]) -> AkoolClient:
+        if self._manual_browser_active(int(account["id"])):
+            raise AkoolBrowserChallengeError("人工验证正在进行，请在验证窗口保存会话")
         if not bool(self.settings.browser_recovery_enabled):
             raise AkoolAuthError("Akool session recovery is disabled")
         try:
@@ -645,6 +707,8 @@ class AKService:
         recover: bool = True,
         enforce_low_balance: bool = True,
     ) -> dict[str, Any]:
+        if recover and self._manual_browser_active(account_id):
+            raise ValueError("人工验证正在进行，请在验证窗口保存会话")
         account = self.db.get_account(account_id)
         if not account:
             raise KeyError("account not found")
@@ -790,16 +854,18 @@ class AKService:
         reservation = 0 if recovering else float(task.get("estimated_cost") or 0)
         while time.monotonic() < deadline:
             with self._account_guard:
-                unavailable = excluded | set(self._active_maintenance)
-            account = self.db.acquire_account(
-                int(preferred) if preferred else None,
-                exclude_ids=unavailable,
-                kind="video",
-                minimum_balance=reservation,
-                task_id=str(task["id"]),
-                recovering=recovering,
-                reservation_cost=reservation,
-            )
+                manual = {key for key in list(self._manual_browser_leases)
+                          if self._manual_browser_active(key)}
+                unavailable = excluded | set(self._active_maintenance) | manual
+                account = self.db.acquire_account(
+                    int(preferred) if preferred else None,
+                    exclude_ids=unavailable,
+                    kind="video",
+                    minimum_balance=reservation,
+                    task_id=str(task["id"]),
+                    recovering=recovering,
+                    reservation_cost=reservation,
+                )
             if account:
                 return account
             available = self.db.available_account_count(excluded)
@@ -1652,6 +1718,7 @@ class AKService:
                             account_id in self._running_logins
                             or account_id in self._running_maintenance
                             or account_id in self._resetting_profiles
+                            or self._manual_browser_active(account_id)
                         ):
                             continue
                         self._running_maintenance.add(account_id)

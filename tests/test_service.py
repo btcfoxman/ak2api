@@ -106,6 +106,64 @@ def settings(tmp_path) -> SimpleNamespace:
     )
 
 
+def test_manual_browser_blocks_automatic_login_and_preserves_disabled_account(tmp_path, monkeypatch):
+    db = Database(str(tmp_path / "manual.db"), default_concurrency=8)
+    account = db.upsert_account({"name": "manual", "email": "user@example.com", "enabled": False})
+    gateway = AKService(db, settings(tmp_path))
+    monkeypatch.setattr(service_module, "browser_snapshot", lambda *a, **k: {"image": "snapshot"})
+    monkeypatch.setattr(service_module, "capture_browser_session", lambda *a: {
+        "cookie_header": "session=new", "access_token": "new-token", "status": "pending",
+    })
+
+    def check(account_id, *, recover):
+        assert recover is False
+        db.update_account(account_id, {"status": "active", "last_error": ""})
+        return db.get_account(account_id, include_secrets=False)
+
+    monkeypatch.setattr(gateway, "check_account", check)
+    try:
+        gateway.open_manual_browser(account["id"])
+        assert gateway.schedule_login(account["id"]) is False
+        assert gateway._manual_browser_active(account["id"])
+        result = gateway.complete_manual_browser(account["id"])
+        assert result["status"] == "active"
+        assert result["enabled"] is False
+        assert db.get_account(account["id"])["cookie_header"] == "session=new"
+        assert not gateway._manual_browser_active(account["id"])
+    finally:
+        gateway.stop()
+
+
+def test_manual_browser_releases_failed_open_and_expired_lease(tmp_path, monkeypatch):
+    db = Database(str(tmp_path / "manual-lease.db"), default_concurrency=8)
+    account = db.upsert_account({"name": "manual"})
+    gateway = AKService(db, settings(tmp_path))
+    monkeypatch.setattr(service_module, "browser_snapshot", lambda *a, **k: (_ for _ in ()).throw(ValueError("browser unavailable")))
+    try:
+        with pytest.raises(ValueError, match="browser unavailable"):
+            gateway.open_manual_browser(account["id"])
+        assert not gateway._manual_browser_active(account["id"])
+        gateway._manual_browser_leases[account["id"]] = time.monotonic() - 1
+        with pytest.raises(ValueError, match="超时"):
+            gateway.manual_browser_snapshot(account["id"])
+        assert account["id"] not in gateway._manual_browser_leases
+    finally:
+        gateway.stop()
+
+
+def test_manual_browser_does_not_compete_with_running_login(tmp_path, monkeypatch):
+    db = Database(str(tmp_path / "manual-login.db"), default_concurrency=8)
+    account = db.upsert_account({"name": "manual"})
+    gateway = AKService(db, settings(tmp_path))
+    gateway._running_logins.add(account["id"])
+    try:
+        with pytest.raises(ValueError, match="登录仍在进行"):
+            gateway.open_manual_browser(account["id"])
+        assert not gateway._manual_browser_active(account["id"])
+    finally:
+        gateway.stop()
+
+
 class FakeAkoolClient:
     default_image_uploads: list[int] = []
 
@@ -915,6 +973,26 @@ def test_runtime_login_limits_update_immediately(tmp_path) -> None:
     assert changed["browser_challenge_grace_seconds"] == 20
     assert gateway._login_slots.limit == 4
     assert gateway._maintenance_slots.limit == 5
+
+
+def test_login_marks_challenge_required_for_manual_intervention(tmp_path, monkeypatch):
+    db = Database(str(tmp_path / "challenge.db"), default_concurrency=8)
+    account = db.upsert_account({"name": "challenge", "enabled": True})
+    gateway = AKService(db, settings(tmp_path))
+
+    def requires_manual(*args):
+        raise service_module.AkoolBrowserChallengeError("requires manual verification")
+
+    monkeypatch.setattr(service_module, "refresh_account_context", requires_manual)
+    try:
+        with pytest.raises(service_module.AkoolBrowserChallengeError):
+            gateway._login_account(account["id"])
+        stored = db.get_account(account["id"])
+        assert stored["status"] == "challenge_required"
+        assert stored["enabled"]
+        assert stored["last_error"] == "requires manual verification"
+    finally:
+        gateway.stop()
 
 
 def test_video_reference_input_setting_rejects_new_tasks_and_updates_models(

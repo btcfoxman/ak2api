@@ -68,6 +68,15 @@ class AccountProfileReset(BaseModel):
     start_login: bool = True
 
 
+class BrowserAction(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    action: Literal["click", "scroll", "login"]
+    x: float = Field(default=0.5, ge=0, le=1)
+    y: float = Field(default=0.5, ge=0, le=1)
+    delta_y: int = Field(default=0, ge=-1000, le=1000)
+
+
 class AccountSyncRequest(AccountUpsert):
     name: str = Field(default="", max_length=120)
 

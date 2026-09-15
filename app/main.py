@@ -30,6 +30,7 @@ from app.schemas import (
     AccountProfileReset,
     AccountSyncRequest,
     AccountUpsert,
+    BrowserAction,
     GenerationTaskCreate,
     SettingsPatch,
 )
@@ -316,6 +317,44 @@ def reset_profile(account_id: int, payload: AccountProfileReset) -> dict[str, An
         return service.reset_account_profile(account_id, **payload.model_dump())
     except Exception as exc:
         raise _detail(exc) from exc
+
+
+@app.post("/api/accounts/{account_id}/browser/open", dependencies=[Depends(_admin_token)])
+def open_account_browser(account_id: int) -> Response:
+    try:
+        return JSONResponse(service.open_manual_browser(account_id), headers={"Cache-Control": "no-store"})
+    except Exception as exc:
+        raise _detail(exc) from exc
+
+
+@app.get("/api/accounts/{account_id}/browser", dependencies=[Depends(_admin_token)])
+def account_browser_snapshot(account_id: int) -> Response:
+    try:
+        return JSONResponse(service.manual_browser_snapshot(account_id), headers={"Cache-Control": "no-store"})
+    except Exception as exc:
+        raise _detail(exc) from exc
+
+
+@app.post("/api/accounts/{account_id}/browser/action", dependencies=[Depends(_admin_token)])
+def account_browser_action(account_id: int, payload: BrowserAction) -> dict[str, Any]:
+    try:
+        return service.manual_browser_action(account_id, payload.model_dump())
+    except Exception as exc:
+        raise _detail(exc) from exc
+
+
+@app.post("/api/accounts/{account_id}/browser/complete", dependencies=[Depends(_admin_token)])
+def complete_account_browser(account_id: int) -> dict[str, Any]:
+    try:
+        return service.complete_manual_browser(account_id)
+    except Exception as exc:
+        raise _detail(exc) from exc
+
+
+@app.post("/api/accounts/{account_id}/browser/close", dependencies=[Depends(_admin_token)])
+def close_account_browser(account_id: int) -> dict[str, bool]:
+    service.close_manual_browser(account_id)
+    return {"closed": True}
 
 
 @app.get("/api/models", dependencies=[Depends(_admin_token)])

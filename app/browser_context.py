@@ -21,6 +21,20 @@ from app.cookies import cookie_header_from_records, cookie_records
 AKOOL_LOGIN_PAGE = "https://akool.com/zh-cn/pricing"
 AKOOL_VERIFY_PATH = "/interface/user-api/api/v6/verify/user"
 
+# The site handles login in JavaScript. Never allow its fallback GET form to
+# put credentials in navigation URLs before React has attached its handler.
+_LOGIN_SUBMIT_GUARD = r"""
+(() => {
+  if (window.__akLoginSubmitGuard) return;
+  window.__akLoginSubmitGuard = true;
+  window.addEventListener('submit', event => {
+    const form = event.target;
+    if (form instanceof HTMLFormElement && form.method.toLowerCase() === 'get' &&
+        form.querySelector('input[type="password"]')) event.preventDefault();
+  });
+})()
+"""
+
 
 class AkoolBrowserError(RuntimeError):
     pass
@@ -51,7 +65,7 @@ def _safe_page_url(value: Any) -> str:
                     "REDACTED"
                     if any(
                         marker in key.lower()
-                        for marker in ("password", "passwd", "token", "secret")
+                        for marker in ("email", "password", "passwd", "token", "secret")
                     )
                     else item,
                 )
@@ -411,12 +425,7 @@ JSON.stringify((() => {
   const text = (document.body && document.body.innerText || '').slice(0, 5000);
   const email = [...document.querySelectorAll('input[type="email"],input[name="email"],input[autocomplete="email"]')].find(visible);
   const password = [...document.querySelectorAll('input[type="password"],input[name="password"],input[autocomplete="current-password"]')].find(visible);
-  const iframeChallenge = [...document.querySelectorAll('iframe')].some((item) => {
-    if (!/cloudflare|turnstile|challenge/i.test(`${item.src || ''} ${item.title || ''}`)) return false;
-    const rect = item.getBoundingClientRect();
-    return visible(item) && rect.width >= 120 && rect.height >= 40;
-  });
-  const challenge = iframeChallenge || /verify you are human|security checkpoint|checking your browser|please confirm you are human/i.test(`${document.title || ''}\n${text}`);
+  const challenge = /verify you are human|security checkpoint|checking your browser|please confirm you are human|验证您是人类|驗證您是人類|确认您是人类|確認您是人類|检查您的浏览器|檢查您的瀏覽器/i.test(`${document.title || ''}\n${text}`);
   const invalidCredentials = /incorrect password|invalid (?:email|account|credentials)|account does not exist|wrong password|邮箱或密码|账号或密码/i.test(text);
   return {
     url: location.href,
@@ -432,9 +441,74 @@ JSON.stringify((() => {
         """
     )
     try:
-        return json.loads(str(raw or "{}"))
+        state = json.loads(str(raw or "{}"))
     except json.JSONDecodeError:
         return {}
+    if not state.get("hasChallenge"):
+        state["hasChallenge"] = _challenge_frame_visible(client)
+    return state
+
+
+def _challenge_frame_visible(client: _CDP) -> bool:
+    """Inspect visible CF frames, including closed shadow roots, without interacting."""
+    document = client.call("DOM.getDocument", {"depth": -1, "pierce": True})
+    pending = [document.get("root") or {}]
+    while pending:
+        node = pending.pop()
+        pending.extend(node.get("children") or [])
+        pending.extend(node.get("shadowRoots") or [])
+        if node.get("contentDocument"):
+            pending.append(node["contentDocument"])
+        if node.get("nodeName") != "IFRAME":
+            continue
+        attributes = node.get("attributes") or []
+        attrs = dict(zip(attributes[::2], attributes[1::2]))
+        try:
+            host = urlsplit(attrs.get("src", "")).hostname
+        except ValueError:
+            continue
+        if host != "challenges.cloudflare.com":
+            continue
+        try:
+            obj = client.call("DOM.resolveNode", {"backendNodeId": node["backendNodeId"]})
+            object_id = (obj.get("object") or {}).get("objectId")
+            if not object_id:
+                continue
+            try:
+                result = client.call("Runtime.callFunctionOn", {
+                    "objectId": object_id,
+                    "functionDeclaration": """function() {
+                      const r = this.getBoundingClientRect();
+                      if (!this.isConnected || r.width < 120 || r.height < 40) return false;
+                      if (typeof this.checkVisibility === 'function')
+                        return this.checkVisibility({checkOpacity:true, checkVisibilityCSS:true});
+                      for (let node = this; node; node = node.parentElement || node.getRootNode().host) {
+                        const style = getComputedStyle(node);
+                        if (style.display === 'none' || style.visibility === 'hidden' ||
+                            style.visibility === 'collapse' || Number(style.opacity) === 0) return false;
+                      }
+                      return true;
+                    }""",
+                    "returnByValue": True,
+                })
+                if (result.get("result") or {}).get("value"):
+                    return True
+            finally:
+                try:
+                    client.call("Runtime.releaseObject", {"objectId": object_id})
+                except AkoolBrowserTransportError:
+                    pass
+        except AkoolBrowserTransportError:
+            # Turnstile may replace its frame while it retries a challenge.
+            continue
+    return False
+
+
+def _challenge_error(page: dict[str, Any]) -> AkoolBrowserChallengeError:
+    return AkoolBrowserChallengeError(
+        "Akool browser challenge requires manual verification"
+        f"; last page={_safe_page_url(page.get('url'))}"
+    )
 
 
 def _browser_verify(client: _CDP) -> dict[str, Any]:
@@ -454,9 +528,35 @@ def _browser_verify(client: _CDP) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _verified_context(client: _CDP, account: dict[str, Any], settings: Any,
+                      body: dict[str, Any]) -> dict[str, Any]:
+    data = body.get("data") or {}
+    user = data.get("user") or {}
+    team = data.get("team") or {}
+    email = str(user.get("email") or "")
+    if not email or (account.get("email") and email.casefold() != str(account["email"]).casefold()):
+        raise AkoolBrowserError("Browser session belongs to a different account")
+    if account.get("user_id") and str(user.get("_id") or "") != str(account["user_id"]):
+        raise AkoolBrowserError("Browser session user id does not match this account")
+    latest = [item for item in client.call("Network.getAllCookies").get("cookies", [])
+              if str(item.get("domain") or "").lstrip(".") == "akool.com"
+              or str(item.get("domain") or "").endswith(".akool.com")]
+    return {
+        "cookie_header": cookie_header_from_records(latest),
+        "cookie_records": latest, "cookies_json": latest,
+        "access_token": str(data.get("token") or ""),
+        "user_id": str(user.get("_id") or ""), "team_id": str(team.get("_id") or ""),
+        "email": email, "user_agent": str(client.evaluate("navigator.userAgent") or ""),
+        "profile_dir": str(_profile_path(account, settings)),
+        "cdp_port": _cdp_port(account, settings), "status": "pending",
+        "last_error": "", "last_login_at": int(time.time()),
+    }
+
+
 def _attempt_login(client: _CDP, email: str, password: str) -> dict[str, Any]:
+    client.evaluate(_LOGIN_SUBMIT_GUARD)
     expression = f"""
-    (() => {{
+    (async () => {{
       const email = {json.dumps(email)};
       const password = {json.dumps(password)};
       const visible = (el) => !!(el && el.getClientRects().length);
@@ -483,11 +583,17 @@ def _attempt_login(client: _CDP, email: str, password: str) -> dict[str, Any]:
         const opened = clickText('log in', 'login', 'sign in', '登录');
         return {{phase:'open-login', opened}};
       }}
+      const form = passwordInput.closest('form');
+      const props = form && Object.keys(form).find(key => key.startsWith('__reactProps'));
+      if (!props || typeof form[props].onSubmit !== 'function')
+        return {{phase:'waiting-for-form', submitted:false}};
       set(emailInput, email);
       set(passwordInput, password);
-      const form = passwordInput.closest('form');
+      await new Promise(resolve => setTimeout(resolve, 0));
+      if (!form.isConnected) return {{phase:'waiting-for-form', submitted:false}};
       const submit = (form && form.querySelector('button[type="submit"],input[type="submit"]')) ||
         [...document.querySelectorAll('button')].find(el => visible(el) && /log in|login|sign in|登录/i.test(el.innerText || ''));
+      if (submit && submit.disabled) return {{phase:'waiting-for-form', submitted:false}};
       if (submit) submit.click(); else if (form) form.requestSubmit();
       return {{phase:'submitted', submitted:!!(submit || form)}};
     }})()
@@ -522,39 +628,7 @@ def refresh_account_context(account: dict[str, Any], settings: Any) -> dict[str,
                     verified = _browser_verify(client)
                     body = verified.get("body") or {}
                     if int(body.get("code") or 0) == 1000:
-                        data = body.get("data") or {}
-                        user = data.get("user") or {}
-                        team = data.get("team") or {}
-                        latest = [
-                            item
-                            for item in list(
-                                (client.call("Network.getAllCookies") or {}).get("cookies")
-                                or []
-                            )
-                            if str(item.get("domain") or "")
-                            .lstrip(".")
-                            .endswith("akool.com")
-                        ]
-                        page = _page_state(client)
-                        return {
-                            "cookie_header": cookie_header_from_records(latest),
-                            "cookie_records": latest,
-                            "cookies_json": latest,
-                            "access_token": str(data.get("token") or ""),
-                            "user_id": str(user.get("_id") or ""),
-                            "team_id": str(team.get("_id") or ""),
-                            "email": str(
-                                user.get("email") or account.get("email") or ""
-                            ),
-                            "user_agent": str(
-                                page.get("ua") or account.get("user_agent") or ""
-                            ),
-                            "profile_dir": str(profile),
-                            "cdp_port": port,
-                            "status": "pending",
-                            "last_error": "",
-                            "last_login_at": int(time.time()),
-                        }
+                        return _verified_context(client, account, settings, body)
                     last_error = str(
                         verified.get("error")
                         or body.get("msg")
@@ -577,18 +651,12 @@ def refresh_account_context(account: dict[str, Any], settings: Any) -> dict[str,
                 last_page = _page_state(client)
                 now = time.monotonic()
                 if last_page.get("hasChallenge"):
-                    challenge_started_at = challenge_started_at or now
+                    if challenge_started_at is None:
+                        challenge_started_at = now
                     if now - challenge_started_at >= int(
                         settings.browser_challenge_grace_seconds
                     ):
-                        detail = " ".join(
-                            str(last_page.get("text") or "").split()
-                        )[:240]
-                        raise AkoolBrowserChallengeError(
-                            "Akool browser challenge requires manual verification"
-                            + (f": {detail}" if detail else "")
-                            + f"; last page={_safe_page_url(last_page.get('url'))}"
-                        )
+                        raise _challenge_error(last_page)
                     time.sleep(1)
                     continue
                 challenge_started_at = None
@@ -620,6 +688,8 @@ def refresh_account_context(account: dict[str, Any], settings: Any) -> dict[str,
                         last_open_at = now
                 time.sleep(1)
 
+            if last_page.get("hasChallenge"):
+                raise _challenge_error(last_page)
             raise AkoolBrowserError(
                 "Akool login did not produce a valid session"
                 f"; last page={_safe_page_url(last_page.get('url'))}"
@@ -639,6 +709,8 @@ def _open_cdp_with_recovery(
         client = _CDP(str(target["webSocketDebuggerUrl"]), timeout=30)
         client.call("Network.enable")
         client.call("Page.enable")
+        client.call("Page.addScriptToEvaluateOnNewDocument", {"source": _LOGIN_SUBMIT_GUARD})
+        client.evaluate(_LOGIN_SUBMIT_GUARD)
         return client
     except AkoolBrowserTransportError:
         _stop_managed_browser_unlocked(int(account["id"]), port)
@@ -649,6 +721,8 @@ def _open_cdp_with_recovery(
             client = _CDP(str(target["webSocketDebuggerUrl"]), timeout=30)
             client.call("Network.enable")
             client.call("Page.enable")
+            client.call("Page.addScriptToEvaluateOnNewDocument", {"source": _LOGIN_SUBMIT_GUARD})
+            client.evaluate(_LOGIN_SUBMIT_GUARD)
             return client
         except Exception as exc:
             raise AkoolBrowserTransportError(

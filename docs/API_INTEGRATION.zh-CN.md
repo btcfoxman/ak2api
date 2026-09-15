@@ -24,4 +24,8 @@ Wan 3.0 的输出时长 `duration` 支持 4～30 秒的整数值，包含 16～3
 
 ## 账号同步
 
+控制台账号操作中的“人工验证”通过原生 CDP 操作原有浏览器，可手动完成 Cloudflare
+验证后保存会话。对应 `/api/accounts/{id}/browser` 系列接口只允许管理会话访问，
+截图不缓存，不对外暴露 Cookie、令牌或任意脚本执行能力。
+
 `POST /api/accounts/sync` 使用 `AK_SYNC_TOKEN`，支持同步 `email`、`password`、`cookie_header`、`cookie_records`、`proxy_url`、`max_concurrency` 和 `auto_login`。相同邮箱更新现有账号，不重复创建。

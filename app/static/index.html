@@ -5,9 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" href="data:,">
   <title>AK2API Console</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20260828-1">
+  <link rel="stylesheet" href="/static/styles.css?v=20260915-1">
   <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
-  <script src="/static/app.js?v=20260828-1" defer></script>
+  <script src="/static/app.js?v=20260915-1" defer></script>
+  <script src="/static/browser-assist.js?v=20260915-1" defer></script>
 </head>
 <body>
   <main class="shell">
@@ -121,6 +122,13 @@
 
   <dialog id="integrationDocsDialog" class="docs-dialog"><div class="dialog-form"><header><div><p class="eyebrow">MARKDOWN</p><h2>模型能力与外部调用</h2></div><div class="section-actions"><button class="icon-button" id="copyIntegrationDocs" type="button" title="复制 Markdown"><i data-lucide="copy"></i></button><button class="icon-button close" type="button"><i data-lucide="x"></i></button></div></header><pre class="docs-code" id="integrationDocsContent">加载中...</pre></div></dialog>
   <dialog id="costReferenceDialog" class="cost-dialog"><div class="dialog-form"><header><div><p class="eyebrow">CREDITS</p><h2>模型消耗参考</h2></div><div class="section-actions"><span class="caption" id="costReferenceStatus">上游询价与真实样本</span><button class="icon-button" id="costReferenceRefresh" type="button"><i data-lucide="refresh-cw"></i></button><button class="icon-button close" type="button"><i data-lucide="x"></i></button></div></header><div class="table-wrap cost-reference-wrap"><table class="cost-reference-table"><thead><tr><th>模型</th><th>时长</th><th>分辨率</th><th>参考消耗</th><th>最近消耗</th><th>样本</th><th>更新时间</th><th>最近任务</th></tr></thead><tbody id="costReferenceBody"></tbody></table><div class="empty" id="costReferenceEmpty"><i data-lucide="coins"></i><span>暂无记录</span></div></div></div></dialog>
+  <dialog id="browserAssistDialog" class="browser-assist-dialog" aria-labelledby="browserAssistTitle">
+    <header class="browser-assist-header"><div><p class="eyebrow">账号登录</p><h2 id="browserAssistTitle">人工验证 <span id="browserAssistAccount" class="mono"></span></h2></div><button class="icon-button close" type="button" aria-label="关闭人工验证"><i data-lucide="x"></i></button></header>
+    <div class="browser-assist-guide"><span class="browser-live-dot"></span><p id="browserAssistStatus" role="status" aria-live="polite">正在连接账号浏览器…</p><span class="caption">画面每 2 秒更新</span></div>
+    <div class="browser-assist-toolbar"><p>点击画面中的验证框，通过后点击「保存登录会话」。</p><div class="section-actions"><button class="button" id="browserAssistLogin" type="button">填写并登录</button><button class="icon-button" id="browserAssistUp" type="button" title="页面向上滚动"><i data-lucide="arrow-up"></i></button><button class="icon-button" id="browserAssistDown" type="button" title="页面向下滚动"><i data-lucide="arrow-down"></i></button><button class="icon-button" id="browserAssistRefresh" type="button" title="刷新画面"><i data-lucide="refresh-cw"></i></button></div></div>
+    <div class="browser-assist-viewport" id="browserAssistViewport"><p id="browserAssistPlaceholder">加载实时画面…</p><img id="browserAssistImage" alt="账号浏览器实时画面，点击画面可操作验证框" draggable="false" hidden></div>
+    <footer class="browser-assist-footer"><span>关闭窗口后保留浏览器和登录进度</span><div class="section-actions"><button class="button close" type="button">稍后继续</button><button class="button primary" id="browserAssistComplete" type="button"><i data-lucide="shield-check"></i><span>保存登录会话</span></button></div></footer>
+  </dialog>
   <div class="media-popover" id="mediaPopover" hidden></div><div class="toast" id="toast"></div>
 </body>
 </html>
