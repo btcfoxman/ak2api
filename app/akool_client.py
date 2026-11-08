@@ -282,9 +282,10 @@ class AkoolClient:
             self.account = self._session_reader() or self.account
         account = dict(self.account)
         revision = int(account.get("session_revision") or 0)
+        preflight_complete = False
 
         def persist(context):
-            nonlocal revision
+            nonlocal revision, preflight_complete
             if self._session_writer:
                 updated = self._session_writer(context, revision)
                 if updated is None:
@@ -293,6 +294,7 @@ class AkoolClient:
                     )
                 self.account = updated
                 revision = int(updated.get("session_revision") or revision)
+            preflight_complete = True
 
         if params:
             url += ("&" if "?" in url else "?") + urlencode(params, doseq=True)
@@ -318,6 +320,11 @@ class AkoolClient:
         except AkoolBrowserTransportError:
             raise
         except (AkoolBrowserError, ValueError, KeyError) as exc:
+            if preflight_complete:
+                # The browser fetch may already have reached a paid endpoint.
+                # A JS/abort error after verified preflight is not evidence of
+                # expired authentication and must never trigger auth replay.
+                raise AkoolBrowserTransportError(str(exc)) from exc
             raise AkoolAuthError(str(exc)) from exc
         try:
             persist(context)

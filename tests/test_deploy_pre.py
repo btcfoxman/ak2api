@@ -58,6 +58,65 @@ def test_environment_order_can_change_but_values_are_unchanged(deployer):
     assert not hasattr(deployer, "MUSAPI_ENV_KEYS")
 
 
+def test_only_proven_implicit_image_defaults_may_change(deployer):
+    changes = deployer.assert_environment_preserved(["PYTHON_VERSION=old", "APP_SECRET=preserve"],
+        ["PYTHON_VERSION=new", "APP_SECRET=preserve"], old_image_defaults=["PYTHON_VERSION=old"],
+        new_image_defaults=["PYTHON_VERSION=new"], explicit_keys={"APP_SECRET"})
+    assert [item["key"] for item in changes] == ["PYTHON_VERSION"]
+    assert changes[0]["source"] == "verified_image_default"
+    assert "old" not in changes[0].values() and "new" not in changes[0].values()
+    assert len(changes[0]["new_value_sha256"]) == 64
+
+
+def test_explicit_override_equal_to_old_default_still_cannot_change(deployer):
+    with pytest.raises(AssertionError, match="explicit container environment changed"):
+        deployer.assert_environment_preserved(["PYTHON_VERSION=old"], ["PYTHON_VERSION=new"],
+            old_image_defaults=["PYTHON_VERSION=old"], new_image_defaults=["PYTHON_VERSION=new"],
+            explicit_keys={"PYTHON_VERSION"})
+
+
+@pytest.mark.parametrize("old,new,old_defaults,new_defaults", [
+    (["PYTHON_VERSION=host-override"], ["PYTHON_VERSION=new"], ["PYTHON_VERSION=old"], ["PYTHON_VERSION=new"]),
+    (["APP_SECRET=private"], ["APP_SECRET=replaced"], [], []),
+    ([], ["UNKNOWN=unexpected"], [], []),
+    (["CUSTOM=preserve"], [], [], []),
+])
+def test_unverified_extra_or_custom_values_are_never_accepted_as_defaults(deployer, old, new, old_defaults, new_defaults):
+    with pytest.raises(AssertionError, match="outside verified image defaults"):
+        deployer.assert_environment_preserved(old, new, old_image_defaults=old_defaults,
+            new_image_defaults=new_defaults)
+
+
+def test_new_default_extra_is_allowed_only_when_not_explicit(deployer):
+    proof = deployer.assert_environment_preserved([], ["NEW_DEFAULT=safe"],
+        old_image_defaults=[], new_image_defaults=["NEW_DEFAULT=safe"])
+    assert proof[0]["key"] == "NEW_DEFAULT" and proof[0]["old_value_sha256"] is None
+    with pytest.raises(AssertionError):
+        deployer.assert_environment_preserved([], ["NEW_DEFAULT=safe"],
+            new_image_defaults=["NEW_DEFAULT=safe"], explicit_keys={"NEW_DEFAULT"})
+
+
+def test_compose_env_keys_are_collected_in_memory_without_logging_values(deployer, monkeypatch, tmp_path, capsys):
+    (tmp_path / ".env").write_text("# comment\nAPP_SECRET=private-value\nexport UNUSED_DEFAULT=same\n")
+    monkeypatch.setattr(deployer.r, "compose", lambda info, override: ["docker", "compose", "-f", "reviewed-compose"])
+    calls = []
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"services": {"ak2api": {
+            "environment": {"PYTHON_VERSION": "private-runtime-value", "HOST_SECRET": "private-host-value"}}}}), stderr="")
+    monkeypatch.setattr(deployer.subprocess, "run", run)
+    keys = deployer.explicit_environment_keys({"directory": str(tmp_path)}, tmp_path / "override")
+    assert keys == {"APP_SECRET", "UNUSED_DEFAULT", "PYTHON_VERSION", "HOST_SECRET"}
+    assert calls[0][0][-3:] == ["config", "--format", "json"]
+    assert capsys.readouterr().out == "" and list(tmp_path.iterdir()) == [tmp_path / ".env"]
+
+
+def test_image_defaults_must_come_from_the_pinned_image_identity(deployer, monkeypatch):
+    monkeypatch.setattr(deployer, "r", SimpleNamespace(inspect=lambda image: {"Id": "other-image", "Config": {"Env": []}}))
+    with pytest.raises(AssertionError, match="image default identity changed"):
+        deployer.image_default_environment("pinned-image")
+
+
 @pytest.mark.parametrize("status", ["browser_login", "profile_resetting", "login_pending", "logging_in", "maintenance", "checking_in"])
 def test_account_work_prevents_release_even_when_tasks_are_terminal(deployer, status):
     assert deployer.busy(database_snapshot(account_statuses={status: 1}))
@@ -261,6 +320,8 @@ def setup_release(deployer, monkeypatch, tmp_path):
     monkeypatch.setattr(deployer, "M", manifest)
     monkeypatch.setattr(deployer, "r", SimpleNamespace(inspect=lambda service: current["container"],
         compose=lambda info, override: ["docker", "compose", str(override)], container_python=lambda service, source: ""))
+    monkeypatch.setattr(deployer, "image_default_environment", lambda image: ["AK_EXISTING=unchanged"])
+    monkeypatch.setattr(deployer, "explicit_environment_keys", lambda info, override: {"AK_EXISTING"})
     snapshot, events = database_snapshot(), []
     monkeypatch.setattr(deployer, "sources_guard", lambda: snapshot)
     monkeypatch.setattr(deployer, "snapshot", lambda: snapshot)
@@ -301,6 +362,21 @@ def test_successful_release_flushes_before_zero_timeout_stop(deployer, monkeypat
     assert receipt["existing_environment_unchanged"] is True
     assert receipt["profile_flush"]["graceful_profile_flush"] is True
     assert receipt["tasks_preserved"] == 1 and receipt["paid_requests"] == 0
+
+
+def test_release_preserves_explicit_app_config_and_audits_verified_base_default_upgrade(deployer, monkeypatch, tmp_path):
+    context = setup_release(deployer, monkeypatch, tmp_path)
+    context.old["Config"] = {"Env": ["AK_EXISTING=unchanged", "PYTHON_VERSION=old"]}
+    context.candidate["Config"] = {"Env": ["AK_EXISTING=unchanged", "PYTHON_VERSION=new"]}
+    monkeypatch.setattr(deployer, "image_default_environment", lambda image:
+        ["PYTHON_VERSION=old"] if image == context.old["Image"] else ["PYTHON_VERSION=new"])
+    monkeypatch.setattr(deployer, "flush_account_browsers", lambda *a: {"flushed_account_browsers": 0})
+    deployer.deploy()
+    receipt = json.loads((context.release / "deployment.json").read_text())
+    assert receipt["application_environment_preserved"] is True
+    assert receipt["existing_environment_unchanged"] is False
+    assert [item["key"] for item in receipt["image_default_environment_changes"]] == ["PYTHON_VERSION"]
+    assert not any(item in json.dumps(receipt) for item in ("PYTHON_VERSION=old", "PYTHON_VERSION=new"))
 
 
 def test_busy_candidate_rollback_defers_without_closing_chrome(deployer, monkeypatch, tmp_path):

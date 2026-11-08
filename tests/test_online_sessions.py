@@ -11,6 +11,7 @@ import app.browser_login as browser_login
 from app.akool_client import AkoolAuthError, AkoolClient, AkoolUpstreamError
 from app.browser_context import (
     AkoolBrowserError,
+    AkoolBrowserChallengeError,
     AkoolBrowserTransportError,
     browser_binding,
 )
@@ -363,6 +364,114 @@ def test_native_paid_post_keeps_acknowledged_result_if_post_capture_is_stale(
     assert len(calls) == 1 and observations == [0, 1]
 
 
+@pytest.mark.parametrize(
+    "error_class,message",
+    [
+        (AkoolBrowserError, "TypeError: Failed to fetch"),
+        (AkoolBrowserError, "AbortError: signal is aborted"),
+        (AkoolBrowserTransportError, "WebSocket closed during submission"),
+    ],
+)
+def test_service_does_not_recover_or_replay_paid_post_after_verified_dispatch(
+    system, monkeypatch, error_class, message
+):
+    _, service = system
+    account = {"id": 1, "session_mode": "managed_profile"}
+    client = AkoolClient(account, service.settings)
+    submitted, recoveries = [], []
+
+    def native(_account, _settings, method, url, *, on_verified, **kwargs):
+        assert method == "POST" and url.endswith("/createBySourcePrompt/batch")
+        on_verified({"cookie_header": "session=verified"})
+        submitted.append(kwargs["payload"])
+        raise error_class(message)
+
+    def recover(_account):
+        recoveries.append(_account)
+        return client
+
+    monkeypatch.setattr(browser_context, "browser_json_request", native)
+    monkeypatch.setattr(service, "_recover_client", recover)
+    with pytest.raises(AkoolUpstreamError) as failure:
+        service._with_recovery(
+            account, client, lambda active: active.generate({"prompt": "fixture"})
+        )
+    assert failure.value.code == "NETWORK_ERROR"
+    assert len(submitted) == 1
+    assert recoveries == []
+
+
+@pytest.mark.parametrize("preflight_failure", ["login", "stale-cas"])
+def test_service_can_recover_before_verified_dispatch(
+    system, monkeypatch, preflight_failure
+):
+    _, service = system
+    account = {"id": 1, "session_mode": "managed_profile"}
+    first = AkoolClient(account, service.settings)
+    recovered = AkoolClient(account, service.settings)
+    if preflight_failure == "stale-cas":
+        first.set_session_callbacks(lambda: account, lambda *_: None)
+    attempts, submitted, recoveries = [], [], []
+
+    def native(_account, _settings, method, url, *, on_verified, **kwargs):
+        attempts.append(method)
+        if len(attempts) == 1 and preflight_failure == "login":
+            raise AkoolBrowserChallengeError("browser session requires login")
+        on_verified({"cookie_header": "session=verified"})
+        submitted.append(kwargs["payload"])
+        return {
+            "status": 200,
+            "body": {"code": 1000, "data": {"successList": [{"_id": "accepted"}]}},
+        }, {}
+
+    def recover(_account):
+        recoveries.append(_account)
+        return recovered
+
+    monkeypatch.setattr(browser_context, "browser_json_request", native)
+    monkeypatch.setattr(service, "_recover_client", recover)
+    result, active = service._with_recovery(
+        account, first, lambda item: item.generate({"prompt": "fixture"})
+    )
+    assert result["generationId"] == "accepted" and active is recovered
+    assert len(attempts) == 2 and len(submitted) == 1 and len(recoveries) == 1
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_explicit_http_auth_rejection_keeps_existing_recovery(
+    system, monkeypatch, status
+):
+    _, service = system
+    account = {"id": 1, "session_mode": "managed_profile"}
+    client = AkoolClient(account, service.settings)
+    responses, recoveries = [], []
+
+    def native(_account, _settings, method, _url, *, on_verified, **kwargs):
+        on_verified({"cookie_header": "session=verified"})
+        responses.append(method)
+        if len(responses) == 1:
+            return {
+                "status": status,
+                "body": {"message": "unauthorized" if status == 401 else "forbidden"},
+            }, {}
+        return {
+            "status": 200,
+            "body": {"code": 1000, "data": {"successList": [{"_id": "accepted"}]}},
+        }, {}
+
+    def recover(_account):
+        recoveries.append(_account)
+        return client
+
+    monkeypatch.setattr(browser_context, "browser_json_request", native)
+    monkeypatch.setattr(service, "_recover_client", recover)
+    result, _ = service._with_recovery(
+        account, client, lambda item: item.generate({"prompt": "fixture"})
+    )
+    assert result["generationId"] == "accepted"
+    assert responses == ["POST", "POST"] and len(recoveries) == 1
+
+
 class Desktop:
     @staticmethod
     def available(*args):
@@ -433,28 +542,35 @@ def test_online_draft_is_disabled_until_identity_and_balance_are_verified(manage
 
 def test_cancel_revokes_interactive_control_before_releasing_account_lease(manager):
     async def scenario():
-        account=manager.store.upsert_account({'name':'closing-ready','enabled':True,'status':'active'})
-        info=await manager.start(account['id'])
-        sid=info['active']['session_id']
-        lease=manager.active
-        ticket=lease['ticket']
-        entered,release=asyncio.Event(),asyncio.Event()
-        original=lease['desktop'].revoke_viewer
+        account = manager.store.upsert_account(
+            {"name": "closing-ready", "enabled": True, "status": "active"}
+        )
+        info = await manager.start(account["id"])
+        sid = info["active"]["session_id"]
+        lease = manager.active
+        ticket = lease["ticket"]
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = lease["desktop"].revoke_viewer
+
         async def delayed_revoke():
             entered.set()
             await release.wait()
             await original()
-        lease['desktop'].revoke_viewer=delayed_revoke
-        closing=asyncio.create_task(manager.cancel(sid))
+
+        lease["desktop"].revoke_viewer = delayed_revoke
+        closing = asyncio.create_task(manager.cancel(sid))
         await entered.wait()
         assert manager.viewer(ticket) is None
-        assert manager.store.get_account(account['id'])['login_lease_until']>int(time.time())
-        assert manager.service.status()['interactive_browser_count']==1
+        assert manager.store.get_account(account["id"])["login_lease_until"] > int(
+            time.time()
+        )
+        assert manager.service.status()["interactive_browser_count"] == 1
         release.set()
         await closing
-        assert manager.store.get_account(account['id'])['login_lease_until']==0
+        assert manager.store.get_account(account["id"])["login_lease_until"] == 0
         assert manager.active is None
         await manager.close()
+
     asyncio.run(scenario())
 
 

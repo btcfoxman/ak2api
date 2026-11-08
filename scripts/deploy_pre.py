@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -43,11 +44,52 @@ r = Runtime()
 TERMINAL = {"succeeded", "success", "completed", "complete", "done", "failed", "error", "cancelled", "canceled", "expired", "deleted", "timeout", "submission_unknown", "polling_paused"}
 
 
-def assert_environment_preserved(before, after):
-    old = dict(item.split("=", 1) for item in before)
-    new = dict(item.split("=", 1) for item in after)
-    assert len(old) == len(before) and len(new) == len(after), "duplicate environment keys"
-    assert old == new, "container environment changed"
+def environment_values(entries):
+    values = dict(item.split("=", 1) for item in entries)
+    assert len(values) == len(entries), "duplicate environment keys"
+    return values
+
+
+def assert_environment_preserved(before, after, *, old_image_defaults=(), new_image_defaults=(), explicit_keys=()):
+    old, new = environment_values(before), environment_values(after)
+    old_defaults, new_defaults = environment_values(old_image_defaults), environment_values(new_image_defaults)
+    explicit, missing, changes = set(explicit_keys), object(), []
+    for key in sorted(set(old) | set(new)):
+        previous, following = old.get(key, missing), new.get(key, missing)
+        if previous == following:
+            continue
+        assert key not in explicit, "explicit container environment changed"
+        assert previous == old_defaults.get(key, missing) and following == new_defaults.get(key, missing), "container environment changed outside verified image defaults"
+        changes.append({"key": key, "source": "verified_image_default",
+            "old_value_sha256": hashlib.sha256(previous.encode()).hexdigest() if previous is not missing else None,
+            "new_value_sha256": hashlib.sha256(following.encode()).hexdigest() if following is not missing else None})
+    return changes
+
+
+def image_default_environment(image_id):
+    image = r.inspect(image_id)
+    assert image["Id"] == image_id, "image default identity changed"
+    return image["Config"].get("Env") or []
+
+
+def explicit_environment_keys(info, override):
+    # Compose and env-file values stay in memory; never send this output to command() logs.
+    result = subprocess.run(r.compose(info, override) + ["config", "--format", "json"],
+                            capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise RuntimeError("cannot inspect explicit deployment environment")
+    try:
+        environment = json.loads(result.stdout)["services"][SERVICE].get("environment") or {}
+        if not isinstance(environment, dict) or not all(isinstance(key, str) for key in environment):
+            raise ValueError
+        keys = set(environment)
+        for line in (Path(info["directory"]) / ".env").read_text(encoding="utf-8-sig").splitlines():
+            match = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:=|$)", line)
+            if match:
+                keys.add(match.group(1))
+        return keys
+    except (ValueError, TypeError, KeyError, OSError):
+        raise RuntimeError("cannot inspect explicit deployment environment") from None
 
 
 def save(name, value):
@@ -440,6 +482,9 @@ def deploy():
     assert command(["docker", "image", "inspect", "--format", "{{.Id}}", built["base_image"]], "verify-rollback-image").strip() == M["image_id"]
     assert command(["docker", "image", "inspect", "--format", "{{.Id}}", built["image"]], "verify-candidate-image").strip() == built["image_id"]
     save("rollback.compose.json", {"services": {SERVICE: {"image": built["base_image"]}}})
+    old_image_defaults = image_default_environment(old["Image"])
+    new_image_defaults = image_default_environment(built["image_id"])
+    explicit_keys = explicit_environment_keys(info, ROOT / "compose.json")
     start = r.compose(info, ROOT / "compose.json") + ["up", "-d", "--no-deps", "--no-build", "--pull", "never", SERVICE]
     restore = r.compose(info, ROOT / "rollback.compose.json") + ["up", "-d", "--no-deps", "--no-build", "--pull", "never", "--force-recreate", SERVICE]
     identity, stopped = None, False
@@ -480,7 +525,9 @@ def deploy():
         assert before_db["protected_tables"] == after_db["protected_tables"], "image cost records modified"
         assert all(after_db["account_config"].get(key) == value for key, value in before_db["account_config"].items()), "account configuration modified"
         assert all(after_db["manual_cost_config"].get(key) == value for key, value in before_db["manual_cost_config"].items()), "manual cost settings modified"
-        assert_environment_preserved(old["Config"]["Env"], current["Config"]["Env"])
+        environment_changes = assert_environment_preserved(old["Config"]["Env"], current["Config"]["Env"],
+            old_image_defaults=old_image_defaults, new_image_defaults=new_image_defaults,
+            explicit_keys=explicit_keys | explicit_environment_keys(info, ROOT / "compose.json"))
         assert old["Mounts"] == current["Mounts"] and old["HostConfig"]["PortBindings"] == current["HostConfig"]["PortBindings"], "mounts/ports changed"
         assert set(old["NetworkSettings"]["Networks"]) == set(current["NetworkSettings"]["Networks"]), "networks changed"
         assert {key: value for key, value in M["app_hashes"].items() if key not in M["files"]} == {key: value for key, value in after["app_hashes"].items() if key not in M["files"]}, "unrelated source changed"
@@ -489,7 +536,9 @@ def deploy():
         report = {"phase": "deployed", "service": SERVICE, "image": built["image"], "files": len(M["files"]),
                   "tasks_preserved": len(before_db["task_hashes"]), "manual_cost_config_preserved": len(before_db["manual_cost_config"]),
                   "settings_routes_unchanged": True, "account_configuration_unchanged": True,
-                  "existing_environment_unchanged": True, "profile_flush": profile_flush,
+                  "existing_environment_unchanged": not environment_changes,
+                  "application_environment_preserved": True, "image_default_environment_changes": environment_changes,
+                  "profile_flush": profile_flush,
                   "other_sources_unchanged": True,
                   "health_status": service_health["status"], "paid_requests": 0}
         save("deployment.json", report)
