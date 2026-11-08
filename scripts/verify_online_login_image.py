@@ -17,20 +17,29 @@ def verify(image):
     name='ak-online-login-smoke-'+secrets.token_hex(6)
     token=secrets.token_urlsafe(24)
     try:
+        run(['docker','run','--rm','--network','none','--entrypoint','python',image,
+            '-B','-c','import app.main; print("isolated_application_import_ok")'])
         run(['docker','run','-d','--name',name,'--network','none','--shm-size','1g',
             '-e','AK_API_KEY='+token,'-e','AK_ADMIN_TOKEN='+token,
             '-e','AK_PROXY_POOL_ENABLED=false','-e','AK_PROXY_POOL=',
             '-e','AK_DAILY_CHECKIN_ENABLED=false','-e','AK_ACCOUNT_MAINTENANCE_INTERVAL_SECONDS=86400',
             '-e','AK_CHROME_EXECUTABLE=/usr/bin/chromium',
             '-e','AK_CHROME_USER_DATA_ROOT=/app/data/ak-chrome-profiles',image])
-        ready=False
+        ready=False;last_probe=''
         for _ in range(45):
             result=subprocess.run(['docker','exec',name,'python','-B','-c',
                 "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8795/health',timeout=2).read()"],
                 capture_output=True,text=True,timeout=8)
             if result.returncode==0:ready=True;break
+            last_probe=(result.stdout+result.stderr)[-3000:]
             time.sleep(1)
-        assert ready,'isolated application did not become healthy'
+        if not ready:
+            details=subprocess.run(['docker','logs','--tail','70',name],capture_output=True,text=True,timeout=15)
+            state=subprocess.run(['docker','inspect','--format','{{json .State}}',name],capture_output=True,text=True,timeout=10)
+            print(json.dumps({'fixture_container_state':state.stdout.strip(),
+                'fixture_startup_log':(details.stdout+details.stderr)[-12000:].replace(token,'[fixture-token]'),
+                'last_readiness_probe':last_probe.replace(token,'[fixture-token]')}),flush=True)
+            raise AssertionError('isolated application did not become healthy; see fixture-only startup diagnostics')
         source=r'''
 import http.cookies,json,urllib.request,urllib.error
 import websocket
