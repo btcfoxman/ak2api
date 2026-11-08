@@ -47,8 +47,9 @@ def verify(image):
                 'last_readiness_probe':last_probe.replace(token,'[fixture-token]')}),flush=True)
             raise AssertionError('isolated application did not become healthy; see fixture-only startup diagnostics')
         source=r'''
-import http.cookies,json,urllib.request,urllib.error
+import http.cookies,json,time,urllib.request,urllib.error
 import websocket
+from app.browser_context import _CDP,_cdp_json
 BASE='http://127.0.0.1:8795'
 TOKEN=__TOKEN__
 def request(method,path,body=None,cookie=None,origin=None):
@@ -87,11 +88,35 @@ try:
  banner=connection.recv()
  assert isinstance(banner,bytes)and banner.startswith(b'RFB ')
 finally:connection.close()
+# Exercise the actual Debian noVNC JavaScript, not only its RFB transport.
+# A disposable tab in this fixture's empty account browser connects to its own
+# private desktop. No external network, real account or generation is involved.
+browser=_CDP(_cdp_json(19800+aid,'/json/version')['webSocketDebuggerUrl'])
+target=None;page=None
+try:
+ target=browser.call('Target.createTarget',{'url':'about:blank'})['targetId']
+ tab=next(item for item in _cdp_json(19800+aid,'/json/list')if item['id']==target)
+ page=_CDP(tab['webSocketDebuggerUrl'])
+ page.call('Network.enable');page.call('Page.enable')
+ for name,value,path in [('ak_admin',TOKEN,'/'),('ak_login_viewer',jar['ak_login_viewer'].value,'/account-login')]:
+  result=page.call('Network.setCookie',{'name':name,'value':value,'url':BASE+path,'path':path,'httpOnly':True,'sameSite':'Strict'})
+  assert result.get('success') is True
+ page.call('Page.navigate',{'url':BASE+'/account-login/viewer'})
+ connected=False;state={}
+ for _ in range(60):
+  state=page.evaluate("({connected:document.getElementById('send-text')?.disabled===false,status:document.getElementById('status')?.textContent||''})")or{}
+  if state.get('connected'):connected=True;break
+  time.sleep(.25)
+ assert connected,'real browser noVNC client did not connect: '+str(state.get('status',''))
+finally:
+ if page:page.close()
+ if target:browser.call('Target.closeTarget',{'targetId':target})
+ browser.close()
 assert request('POST',f'/api/account-login/{sid}/cancel',{})[0]==200
 assert request('GET','/account-login/credentials',cookie=cookie)[0]in{401,403}
 assert request('GET','/api/account-login')[1]['active']is None
 print(json.dumps({'app_healthy':True,'desktop_available':True,'real_chrome_xvfb_vnc_started':True,
- 'authenticated_same_origin_viewer':True,'live_websocket_rfb_handshake':True,'ticket_revoked_on_cancel':True,
+ 'authenticated_same_origin_viewer':True,'live_websocket_rfb_handshake':True,'real_browser_novnc_connected':True,'ticket_revoked_on_cancel':True,
  'unauthenticated_and_cross_site_rejected':True,'external_network':'disabled','generation_posts':0}))
 '''.replace('__TOKEN__',repr(token))
         report=json.loads(run(['docker','exec','-i',name,'python','-B','-'],input=source,timeout=160))

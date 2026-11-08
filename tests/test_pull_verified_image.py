@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
 import importlib.util
 import io
 import json
@@ -202,8 +203,16 @@ def prepare_main(puller, monkeypatch, tmp_path, *, index=False):
     expected = "/home/btcfoxman/docker/ak2api"
     real_path = Path
     monkeypatch.setattr(puller, "Path", lambda value: root if str(value) == expected else real_path(value))
-    revision, config_digest = "a" * 40, "sha256:" + "b" * 64
-    manifest = {"config": {"digest": config_digest}, "layers": [{"digest": "sha256:" + "c" * 64, "size": 2097152}]}
+    revision = "a" * 40
+    runtime = {"Labels": {"org.opencontainers.image.revision": revision}, "Env": ["APP=fixture"],
+               "Cmd": ["python", "-m", "app"], "WorkingDir": "/app"}
+    configuration = {"os": "linux", "architecture": "amd64", "config": runtime,
+                     "rootfs": {"type": "layers", "diff_ids": ["sha256:" + "d" * 64]}}
+    config_raw = json.dumps(configuration).encode()
+    config_digest = "sha256:" + hashlib.sha256(config_raw).hexdigest()
+    manifest = {"config": {"digest": config_digest, "size": len(config_raw)}, "layers": [{
+        "digest": "sha256:" + "c" * 64, "size": 2097152,
+        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip"}]}
     raw_manifest = json.dumps(manifest).encode()
     image_digest = "sha256:" + hashlib.sha256(raw_manifest).hexdigest()
     parent = {"manifests": [{"platform": {"os": "linux", "architecture": "amd64"}, "digest": image_digest}]}
@@ -220,6 +229,7 @@ def prepare_main(puller, monkeypatch, tmp_path, *, index=False):
     def read(url, route, headers=None, **kwargs):
         reads.append((url, route, headers))
         if "/token?" in url: return b'{"token":"private-registry-token"}'
+        if "/blobs/" in url: return config_raw
         return raw_manifest if index and url.endswith(image_digest) else raw
 
     def command(args, **kwargs):
@@ -227,7 +237,9 @@ def prepare_main(puller, monkeypatch, tmp_path, *, index=False):
             return str(root).encode()
         commands.append(args)
         if args[:3] == ["docker", "image", "inspect"]:
-            return json.dumps([{"Id": config_digest, "Size":8388608, "Config": {"Labels": {"org.opencontainers.image.revision": revision}}}]).encode()
+            return json.dumps([{"Id": config_digest, "Size":8388608, "Config": runtime,
+                "Os": "linux", "Architecture": "amd64", "RootFS": {"Type": "layers",
+                "Layers": configuration["rootfs"]["diff_ids"]}}]).encode()
         return b""
 
     def pull(binary, reference, archive, route):
@@ -238,10 +250,13 @@ def prepare_main(puller, monkeypatch, tmp_path, *, index=False):
     monkeypatch.setattr(puller, "command", command)
     monkeypatch.setattr(puller, "pull", pull)
     monkeypatch.setattr(puller, "acquire_tool", lambda folder, routes, cache: folder / "crane")
+    monkeypatch.setattr(puller, "validate_archive", lambda *args: {
+        "verified_layer_count": 1, "verified_expanded_bytes": 16777216, "verified_compressed_layer_bytes": 2097152})
     monkeypatch.setattr(puller, "sample", lambda url, route, headers: {
         "route": "proxy" if route else "direct", "complete": True, "bytes": 1048576,
         "seconds": 1 if route else 2, "bytes_per_second": 1048576 if route else 524288})
     return SimpleNamespace(root=root, raw=raw, digest=digest, image_digest=image_digest, config=config_digest,
+                           configuration=configuration, config_raw=config_raw, runtime=runtime,
                            image=image, revision=revision, reads=reads, commands=commands, pulls=pulls)
 
 
@@ -321,7 +336,7 @@ def test_loaded_revision_mismatch_never_tags_release(puller, monkeypatch, tmp_pa
             "org.opencontainers.image.revision": "f" * 40}}}]).encode() if args[1] == "image" else b""
 
     monkeypatch.setattr(puller, "command", command)
-    with pytest.raises(RuntimeError, match="loaded_image_identity_mismatch"):
+    with pytest.raises(RuntimeError, match="loaded_image_config_mismatch|loaded_image_revision_mismatch"):
         puller.main()
     assert not any(args[1] == "tag" for args in context.commands)
     assert not (context.root / "last-image-pull.safe.json").exists()
@@ -347,3 +362,89 @@ def test_docker_storage_disk_is_checked_separately(puller, monkeypatch, tmp_path
     monkeypatch.setattr(puller.shutil,'disk_usage',lambda path:SimpleNamespace(free=2**40 if path==root else 1))
     with pytest.raises(RuntimeError,match='image_import_disk_budget_unavailable'):
         puller.check_disk_budget(root,2097152,8388608)
+
+
+def test_containerd_manifest_id_and_store_size_difference_preserve_verified_identity(puller, monkeypatch, tmp_path):
+    context = prepare_main(puller, monkeypatch, tmp_path)
+    original_command = puller.command
+
+    def command(args, **kwargs):
+        value = original_command(args, **kwargs)
+        if args[:3] == ["docker", "image", "inspect"]:
+            item = json.loads(value)[0]
+            item["Id"], item["Size"] = context.image_digest, 8388608 - 389
+            return json.dumps([item]).encode()
+        return value
+
+    monkeypatch.setattr(puller, "command", command)
+    puller.main()
+    assert context.commands[-1] == ["docker", "tag", context.image_digest, context.image]
+    receipt = json.loads((context.root / "last-image-pull.safe.json").read_text())
+    assert receipt["loaded_config_digest"] == context.config
+    assert receipt["loaded_image_id"] == context.image_digest
+    assert receipt["store_size_reporting_difference"] == -389
+    assert receipt["archive_proof"]["verified_expanded_bytes"] == 16777216
+
+
+def test_config_blob_digest_failure_never_downloads_or_loads_image(puller, monkeypatch, tmp_path):
+    context = prepare_main(puller, monkeypatch, tmp_path)
+    original_read = puller.read_bounded
+
+    def read(url, *args, **kwargs):
+        value = original_read(url, *args, **kwargs)
+        return value + b" " if "/blobs/" in url else value
+
+    monkeypatch.setattr(puller, "read_bounded", read)
+    with pytest.raises(RuntimeError, match="registry_verified_config_unavailable"):
+        puller.main()
+    assert context.pulls == [] and context.commands == []
+
+
+def test_archive_proof_failure_never_loads_or_tags(puller, monkeypatch, tmp_path):
+    context = prepare_main(puller, monkeypatch, tmp_path)
+    monkeypatch.setattr(puller, "validate_archive", lambda *args: (_ for _ in ()).throw(
+        RuntimeError("image_archive_rootfs_digest_mismatch")))
+    with pytest.raises(RuntimeError, match="image_archive_rootfs_digest_mismatch"):
+        puller.main()
+    assert len(context.pulls) == 1 and context.commands == []
+
+
+def test_loaded_runtime_option_change_never_tags_release(puller, monkeypatch, tmp_path):
+    context = prepare_main(puller, monkeypatch, tmp_path)
+    original_command = puller.command
+
+    def command(args, **kwargs):
+        value = original_command(args, **kwargs)
+        if args[:3] == ["docker", "image", "inspect"]:
+            item = json.loads(value)[0]
+            item["Config"]["Env"] = ["APP=changed"]
+            return json.dumps([item]).encode()
+        return value
+
+    monkeypatch.setattr(puller, "command", command)
+    with pytest.raises(RuntimeError, match="loaded_image_config_mismatch"):
+        puller.main()
+    assert not any(args[1] == "tag" for args in context.commands)
+
+
+def test_verified_expanded_disk_budget_is_checked_before_load(puller, monkeypatch, tmp_path):
+    context = prepare_main(puller, monkeypatch, tmp_path)
+    budgets = []
+
+    def check(root, compressed, expanded):
+        budgets.append(expanded)
+        if len(budgets) == 2:
+            raise RuntimeError("image_import_disk_budget_unavailable")
+
+    monkeypatch.setattr(puller, "check_disk_budget", check)
+    with pytest.raises(RuntimeError, match="image_import_disk_budget_unavailable"):
+        puller.main()
+    assert budgets == [8388608, 16777216] and context.commands == []
+
+
+def test_docker_command_failure_reports_safe_stage_without_stderr_or_arguments(puller, monkeypatch):
+    monkeypatch.setattr(puller.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
+        returncode=1, stdout=b"", stderr=b"proxy-password-and-signed-url"))
+    with pytest.raises(RuntimeError) as caught:
+        puller.command(["docker", "image", "inspect", "private-reference"], stage="docker_inspect_loaded_tag")
+    assert str(caught.value) == "verified_image_failed:docker_inspect_loaded_tag:exit=1"
