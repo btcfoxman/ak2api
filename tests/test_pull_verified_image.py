@@ -97,29 +97,66 @@ def test_route_environment_does_not_inherit_other_proxy_variants(puller, monkeyp
     assert "NO_PROXY" not in proxied and "all_proxy" not in proxied
 
 
-@pytest.mark.parametrize("partial_status,complete", [(206, True), (200, False)])
+@pytest.mark.parametrize("partial_status,complete", [(206, True), (200, True), (500, False)])
 def test_speed_sample_requires_exact_one_megabyte_range(puller, monkeypatch, partial_status, complete):
     # The pull helper runs on Linux. Replace timers for a deterministic Windows-safe offline test.
     monkeypatch.setattr(puller.signal, "SIGALRM", 14, raising=False)
     monkeypatch.setattr(puller.signal, "ITIMER_REAL", 0, raising=False)
     monkeypatch.setattr(puller.signal, "signal", lambda *_: None)
     monkeypatch.setattr(puller.signal, "setitimer", lambda *_: None, raising=False)
-    ticks = iter([0, 2])
+    ticks = iter([0, 1, 2])
     monkeypatch.setattr(puller.time, "monotonic", lambda: next(ticks))
-    seen = []
+    seen, streams = [], []
 
     def response(url, route, headers, **kwargs):
         seen.append((url, route, headers))
-        result = Stream(b"x" * 1048576)
+        class CountedStream(Stream):
+            consumed = 0
+            def read(self, size=-1):
+                value = super().read(size)
+                self.consumed += len(value)
+                return value
+        result = CountedStream(b"x" * 2097152)
         result.status = partial_status
+        streams.append(result)
         return result
 
     monkeypatch.setattr(puller, "response", response)
     result = puller.sample("https://ghcr.io/v2/repo/blobs/private-layer", None, {"Authorization": "Bearer private"})
     assert result["complete"] is complete
     assert result["bytes"] == (1048576 if complete else 0)
+    assert result["failure_kind"] == (None if complete else "http_status_500")
+    assert result["seconds"] == 2 and result["ttfb_seconds"] == 1 and result["body_seconds"] == 1
+    assert result["bytes_per_second"] == (1048576 if complete else 0)
+    assert streams[0].closed and streams[0].consumed == (1048576 if complete else 0)
     assert seen == [("https://ghcr.io/v2/repo/blobs/private-layer", None, {
         "Authorization": "Bearer private", "Range": "bytes=0-1048575", "Accept-Encoding": "identity"})]
+
+
+@pytest.mark.parametrize("outcome,expected", [("short_json", "short_read"), ("http_error", "http_status_503"),
+                                               ("network", "exception_URLError"), ("deadline", "deadline")])
+def test_sample_failure_details_are_safe_and_do_not_accept_short_json(puller, monkeypatch, outcome, expected):
+    monkeypatch.setattr(puller.signal, "SIGALRM", 14, raising=False)
+    monkeypatch.setattr(puller.signal, "ITIMER_REAL", 0, raising=False)
+    handler = []
+    monkeypatch.setattr(puller.signal, "signal", lambda sig, callback: handler.append(callback))
+    monkeypatch.setattr(puller.signal, "setitimer", lambda *_: None, raising=False)
+    ticks = iter([0, 1, 2])
+    monkeypatch.setattr(puller.time, "monotonic", lambda: next(ticks))
+
+    def response(*args, **kwargs):
+        if outcome == "network":raise urllib.error.URLError("credential-and-signed-url")
+        if outcome == "http_error":raise puller.ArtifactHTTPError(503)
+        if outcome == "deadline":handler[0]()
+        stream = Stream(b'{"message":"not an image layer"}')
+        stream.status = 200
+        return stream
+
+    monkeypatch.setattr(puller, "response", response)
+    result = puller.sample("https://ghcr.io/signed-secret", "http://proxy:secret@127.0.0.1:10809", {})
+    assert result["complete"] is False and result["failure_kind"] == expected
+    assert result["bytes"] < 1048576
+    assert "secret" not in json.dumps(result) and "credential" not in json.dumps(result)
 
 
 def tool_archive(*, link=False):
@@ -448,3 +485,28 @@ def test_docker_command_failure_reports_safe_stage_without_stderr_or_arguments(p
     with pytest.raises(RuntimeError) as caught:
         puller.command(["docker", "image", "inspect", "private-reference"], stage="docker_inspect_loaded_tag")
     assert str(caught.value) == "verified_image_failed:docker_inspect_loaded_tag:exit=1"
+
+
+def test_no_transfer_route_prints_safe_sample_diagnostics_before_failure(puller, monkeypatch, tmp_path, capsys):
+    context = prepare_main(puller, monkeypatch, tmp_path)
+    monkeypatch.setattr(puller, "sample", lambda url, route, headers: {
+        "route": "proxy" if route else "direct", "complete": False,
+        "failure_kind": "exception_URLError" if route else "short_read", "bytes": 0,
+        "seconds": 1, "bytes_per_second": 0})
+    with pytest.raises(RuntimeError, match="image_transfer_routes_unavailable"):
+        puller.main()
+    report = json.loads(capsys.readouterr().out)
+    assert report["stage"] == "image_transfer_samples"
+    assert {item["failure_kind"] for item in report["route_samples"]} == {"short_read", "exception_URLError"}
+    assert "private" not in json.dumps(report) and "127.0.0.1" not in json.dumps(report)
+    assert context.pulls == [] and context.commands == []
+
+
+def test_registry_http_status_is_preserved_without_url_or_response_details(puller, monkeypatch):
+    def opened(request, **kwargs):
+        raise urllib.error.HTTPError(request.full_url, 500, "sensitive-upstream-detail", {}, None)
+    monkeypatch.setattr(puller, "transport", lambda proxy: SimpleNamespace(open=opened))
+    with pytest.raises(puller.ArtifactHTTPError) as caught:
+        puller.response("https://ghcr.io/private?signature=secret", None)
+    assert caught.value.status == 500
+    assert str(caught.value) == "registry_http_rejected:status=500"
