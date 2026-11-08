@@ -35,19 +35,24 @@ from app.schemas import (
     SettingsPatch,
 )
 from app.service import AKService
+from app.browser_login import BrowserLoginManager
+from app.browser_login_api import register_browser_login
 
 
 BASE_DIR = Path(__file__).resolve().parent
 database = Database(settings.database_path, settings.account_default_concurrency)
 service = AKService(database, settings)
+browser_login = BrowserLoginManager(database, service)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     service.start()
+    browser_login.start_maintenance()
     try:
         yield
     finally:
+        await browser_login.close()
         service.stop()
 
 
@@ -74,6 +79,9 @@ def _api_token(
         token = authorization[7:].strip()
     if not token or not secrets.compare_digest(token, settings.api_key):
         raise HTTPException(status_code=401, detail="invalid API key")
+
+
+register_browser_login(app, browser_login, _admin_token, lambda: settings.admin_token)
 
 
 def _sync_token(

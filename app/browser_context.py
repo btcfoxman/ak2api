@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -16,7 +17,6 @@ import websocket
 
 from app.config import normalize_proxy_url, rewrite_loopback_proxy
 from app.cookies import cookie_header_from_records, cookie_records
-
 
 AKOOL_LOGIN_PAGE = "https://akool.com/zh-cn/pricing"
 AKOOL_VERIFY_PATH = "/interface/user-api/api/v6/verify/user"
@@ -62,12 +62,20 @@ def _safe_page_url(value: Any) -> str:
             [
                 (
                     key,
-                    "REDACTED"
-                    if any(
-                        marker in key.lower()
-                        for marker in ("email", "password", "passwd", "token", "secret")
-                    )
-                    else item,
+                    (
+                        "REDACTED"
+                        if any(
+                            marker in key.lower()
+                            for marker in (
+                                "email",
+                                "password",
+                                "passwd",
+                                "token",
+                                "secret",
+                            )
+                        )
+                        else item
+                    ),
                 )
                 for key, item in parse_qsl(parsed.query, keep_blank_values=True)
             ]
@@ -139,7 +147,9 @@ class _CDP:
         )
         result = value.get("result") or {}
         if result.get("subtype") == "error":
-            raise AkoolBrowserError(str(result.get("description") or "browser script failed"))
+            raise AkoolBrowserError(
+                str(result.get("description") or "browser script failed")
+            )
         return result.get("value")
 
 
@@ -203,7 +213,9 @@ def _cdp_port(account: dict[str, Any], settings: Any) -> int:
         or (int(settings.chrome_cdp_base_port) + int(account["id"]))
     )
     if not 1024 <= port <= 65535:
-        raise AkoolBrowserError(f"invalid CDP port for account #{account['id']}: {port}")
+        raise AkoolBrowserError(
+            f"invalid CDP port for account #{account['id']}: {port}"
+        )
     return port
 
 
@@ -339,6 +351,8 @@ def _launch(
         "--no-default-browser-check",
         "--disable-background-mode",
     ]
+    if str(account.get("user_agent") or "").strip():
+        command.append("--user-agent=" + str(account["user_agent"]))
     if proxy:
         command.append(f"--proxy-server={proxy}")
     if bool(settings.chrome_headless):
@@ -378,7 +392,9 @@ def _launch(
 
 def _safe_cookie_records(account: dict[str, Any]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
-    records = cookie_records(account.get("cookie_records") or account.get("cookies_json"))
+    records = cookie_records(
+        account.get("cookie_records") or account.get("cookies_json")
+    )
     if not records and str(account.get("cookie_header") or "").strip():
         parsed = SimpleCookie()
         try:
@@ -418,8 +434,7 @@ def _safe_cookie_records(account: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _page_state(client: _CDP) -> dict[str, Any]:
-    raw = client.evaluate(
-        r"""
+    raw = client.evaluate(r"""
 JSON.stringify((() => {
   const visible = (el) => Boolean(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
   const text = (document.body && document.body.innerText || '').slice(0, 5000);
@@ -438,8 +453,7 @@ JSON.stringify((() => {
     invalidCredentials: Boolean(invalidCredentials)
   };
 })())
-        """
-    )
+        """)
     try:
         state = json.loads(str(raw or "{}"))
     except json.JSONDecodeError:
@@ -470,14 +484,18 @@ def _challenge_frame_visible(client: _CDP) -> bool:
         if host != "challenges.cloudflare.com":
             continue
         try:
-            obj = client.call("DOM.resolveNode", {"backendNodeId": node["backendNodeId"]})
+            obj = client.call(
+                "DOM.resolveNode", {"backendNodeId": node["backendNodeId"]}
+            )
             object_id = (obj.get("object") or {}).get("objectId")
             if not object_id:
                 continue
             try:
-                result = client.call("Runtime.callFunctionOn", {
-                    "objectId": object_id,
-                    "functionDeclaration": """function() {
+                result = client.call(
+                    "Runtime.callFunctionOn",
+                    {
+                        "objectId": object_id,
+                        "functionDeclaration": """function() {
                       const r = this.getBoundingClientRect();
                       if (!this.isConnected || r.width < 120 || r.height < 40) return false;
                       if (typeof this.checkVisibility === 'function')
@@ -489,8 +507,9 @@ def _challenge_frame_visible(client: _CDP) -> bool:
                       }
                       return true;
                     }""",
-                    "returnByValue": True,
-                })
+                        "returnByValue": True,
+                    },
+                )
                 if (result.get("result") or {}).get("value"):
                     return True
             finally:
@@ -528,28 +547,55 @@ def _browser_verify(client: _CDP) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _verified_context(client: _CDP, account: dict[str, Any], settings: Any,
-                      body: dict[str, Any]) -> dict[str, Any]:
+def _verified_context(
+    client: _CDP, account: dict[str, Any], settings: Any, body: dict[str, Any]
+) -> dict[str, Any]:
     data = body.get("data") or {}
     user = data.get("user") or {}
     team = data.get("team") or {}
     email = str(user.get("email") or "")
-    if not email or (account.get("email") and email.casefold() != str(account["email"]).casefold()):
+    if not email or (
+        account.get("email") and email.casefold() != str(account["email"]).casefold()
+    ):
         raise AkoolBrowserError("Browser session belongs to a different account")
     if account.get("user_id") and str(user.get("_id") or "") != str(account["user_id"]):
         raise AkoolBrowserError("Browser session user id does not match this account")
-    latest = [item for item in client.call("Network.getAllCookies").get("cookies", [])
-              if str(item.get("domain") or "").lstrip(".") == "akool.com"
-              or str(item.get("domain") or "").endswith(".akool.com")]
+    latest = [
+        item
+        for item in client.call("Network.getAllCookies").get("cookies", [])
+        if str(item.get("domain") or "").lstrip(".") == "akool.com"
+        or str(item.get("domain") or "").endswith(".akool.com")
+    ]
+    hints = client.evaluate(
+        "({brands:navigator.userAgentData?.brands||[],platform:navigator.userAgentData?.platform||''})"
+    )
+    hints = hints if isinstance(hints, dict) else {}
+    brands = hints.get("brands") or []
+    sec_ua = ", ".join(
+        json.dumps(str(item.get("brand") or ""))
+        + ";v="
+        + json.dumps(str(item.get("version") or ""))
+        for item in brands
+        if isinstance(item, dict)
+    )
     return {
         "cookie_header": cookie_header_from_records(latest),
-        "cookie_records": latest, "cookies_json": latest,
+        "cookie_records": latest,
+        "cookies_json": latest,
         "access_token": str(data.get("token") or ""),
-        "user_id": str(user.get("_id") or ""), "team_id": str(team.get("_id") or ""),
-        "email": email, "user_agent": str(client.evaluate("navigator.userAgent") or ""),
+        "user_id": str(user.get("_id") or ""),
+        "team_id": str(team.get("_id") or ""),
+        "email": email,
+        "user_agent": str(client.evaluate("navigator.userAgent") or ""),
+        "sec_ch_ua": sec_ua,
+        "sec_ch_ua_platform": json.dumps(str(hints.get("platform") or "")),
+        "session_mode": "managed_profile",
+        "browser_binding": browser_binding(account, settings),
         "profile_dir": str(_profile_path(account, settings)),
-        "cdp_port": _cdp_port(account, settings), "status": "pending",
-        "last_error": "", "last_login_at": int(time.time()),
+        "cdp_port": _cdp_port(account, settings),
+        "status": "pending",
+        "last_error": "",
+        "last_login_at": int(time.time()),
     }
 
 
@@ -611,8 +657,22 @@ def refresh_account_context(account: dict[str, Any], settings: Any) -> dict[str,
         profile = _profile_path(account, settings)
         client = _open_cdp_with_recovery(account, settings, port, profile)
         try:
+            # A warm profile is authoritative: never overwrite its fresh login
+            # with the older database cookie snapshot.
+            current_host = urlsplit(
+                str(client.evaluate("location.href") or "")
+            ).hostname
+            current = (
+                (_browser_verify(client).get("body") or {})
+                if current_host == "akool.com"
+                else {}
+            )
+            if int(current.get("code") or 0) == 1000:
+                return _verified_context(client, account, settings, current)
+            if int(current.get("code") or 0) == 1108:
+                raise AkoolBrowserAccountSuspended("Akool account has been suspended")
             imported = _safe_cookie_records(account)
-            if imported:
+            if imported and account.get("session_mode") != "managed_profile":
                 client.call("Network.setCookies", {"cookies": imported})
             client.call("Page.navigate", {"url": AKOOL_LOGIN_PAGE})
             deadline = time.monotonic() + int(settings.browser_timeout_seconds)
@@ -699,6 +759,143 @@ def refresh_account_context(account: dict[str, Any], settings: Any) -> dict[str,
             client.close()
 
 
+def browser_binding(account: dict[str, Any], settings: Any) -> dict[str, Any]:
+    proxy = rewrite_loopback_proxy(
+        normalize_proxy_url(str(account.get("proxy_url") or "")),
+        str(getattr(settings, "proxy_host_override", "") or ""),
+    )
+    return {
+        "profile": str(_profile_path(account, settings)),
+        "port": _cdp_port(account, settings),
+        "proxy_sha256": hashlib.sha256(proxy.encode()).hexdigest(),
+    }
+
+
+def capture_native_context(account: dict[str, Any], settings: Any) -> dict[str, Any]:
+    """Capture the same warm profile used by requests; do not navigate or seed cookies."""
+    with _account_lock(int(account["id"])):
+        expected = account.get("browser_binding") or {}
+        if expected and expected != browser_binding(account, settings):
+            raise AkoolBrowserError(
+                "browser profile/proxy binding changed; reopen the account login"
+            )
+        client = _open_cdp_with_recovery(
+            account,
+            settings,
+            _cdp_port(account, settings),
+            _profile_path(account, settings),
+        )
+        try:
+            host = urlsplit(str(client.evaluate("location.href") or "")).hostname or ""
+            if host != "akool.com":
+                raise AkoolBrowserError("account browser is not on an Akool page")
+            body = _browser_verify(client).get("body") or {}
+            if body.get("code") == 1108:
+                raise AkoolBrowserAccountSuspended("Akool account has been suspended")
+            if body.get("code") != 1000:
+                raise AkoolBrowserChallengeError(
+                    "browser session requires login or verification"
+                )
+            return _verified_context(client, account, settings, body)
+        finally:
+            client.close()
+
+
+def browser_json_request(
+    account: dict[str, Any],
+    settings: Any,
+    method: str,
+    url: str,
+    *,
+    payload=None,
+    headers=None,
+    on_verified=None,
+):
+    """Issue Akool JSON from its authenticated browser, preserving native IP/UA/cookies."""
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "akool.com"
+        or parsed.port not in (None, 443)
+        or parsed.username
+        or parsed.password
+    ):
+        raise AkoolBrowserError(
+            "native browser requests only support the Akool HTTPS origin"
+        )
+    expected = account.get("browser_binding") or {}
+    if expected and expected != browser_binding(account, settings):
+        raise AkoolBrowserError(
+            "browser profile/proxy binding changed; reopen the account login"
+        )
+    with _account_lock(int(account["id"])):
+        client = _open_cdp_with_recovery(
+            account,
+            settings,
+            _cdp_port(account, settings),
+            _profile_path(account, settings),
+        )
+        request_timeout = max(
+            5, min(600, float(getattr(settings, "request_timeout_seconds", 90)))
+        )
+        client.timeout = request_timeout + 15
+        try:
+            host = urlsplit(str(client.evaluate("location.href") or "")).hostname or ""
+            if host != "akool.com":
+                raise AkoolBrowserError("account browser is not on an Akool page")
+            identity = _browser_verify(client).get("body") or {}
+            if identity.get("code") == 1108:
+                raise AkoolBrowserAccountSuspended("Akool account has been suspended")
+            if identity.get("code") != 1000:
+                raise AkoolBrowserChallengeError(
+                    "browser session requires login or verification"
+                )
+            context = _verified_context(client, account, settings, identity)
+            if on_verified:
+                on_verified(context)
+            safe_headers = {
+                k: v
+                for k, v in (headers or {}).items()
+                if k.lower() in {"accept", "content-type"}
+            }
+            request_config = {
+                "url": url,
+                "method": method,
+                "headers": safe_headers,
+                "hasBody": payload is not None,
+                "payload": payload,
+                "timeout": int(request_timeout * 1000),
+            }
+            value = client.evaluate("""(async()=>{
+              const config=__REQUEST_CONFIG__;
+              const controller=new AbortController();
+              const timer=setTimeout(()=>controller.abort(),config.timeout);
+              try {
+                const response=await fetch(config.url,{method:config.method,credentials:'include',redirect:'error',
+                  headers:config.headers,signal:controller.signal,...(config.hasBody?{body:JSON.stringify(config.payload)}:{})});
+                let body;
+                try{body=await response.json()}catch(_){body={message:'Akool returned a non-JSON response'}}
+                return {status:response.status,body,headers:{'content-type':response.headers.get('content-type')||'',
+                  'retry-after':response.headers.get('retry-after')||''}};
+              } finally {clearTimeout(timer)}
+            })()""".replace("__REQUEST_CONFIG__", json.dumps(request_config)))
+            if not isinstance(value, dict) or not isinstance(value.get("status"), int):
+                raise AkoolBrowserTransportError(
+                    "native Akool request did not return a response"
+                )
+            # Capture browser-managed Set-Cookie after the operation. Failure to
+            # refresh an observation must never replay an accepted paid POST.
+            try:
+                after = _browser_verify(client).get("body") or {}
+                if after.get("code") == 1000:
+                    context = _verified_context(client, account, settings, after)
+            except AkoolBrowserError:
+                pass
+            return value, context
+        finally:
+            client.close()
+
+
 def _open_cdp_with_recovery(
     account: dict[str, Any], settings: Any, port: int, profile: Path
 ) -> _CDP:
@@ -709,11 +906,13 @@ def _open_cdp_with_recovery(
         client = _CDP(str(target["webSocketDebuggerUrl"]), timeout=30)
         client.call("Network.enable")
         client.call("Page.enable")
-        client.call("Page.addScriptToEvaluateOnNewDocument", {"source": _LOGIN_SUBMIT_GUARD})
+        client.call(
+            "Page.addScriptToEvaluateOnNewDocument", {"source": _LOGIN_SUBMIT_GUARD}
+        )
         client.evaluate(_LOGIN_SUBMIT_GUARD)
         return client
     except AkoolBrowserTransportError:
-        _stop_managed_browser_unlocked(int(account["id"]), port)
+        stop_idle_account_browser(account, settings)
         _wait_for_endpoint_closed(port)
         _launch(account, settings)
         try:
@@ -721,7 +920,9 @@ def _open_cdp_with_recovery(
             client = _CDP(str(target["webSocketDebuggerUrl"]), timeout=30)
             client.call("Network.enable")
             client.call("Page.enable")
-            client.call("Page.addScriptToEvaluateOnNewDocument", {"source": _LOGIN_SUBMIT_GUARD})
+            client.call(
+                "Page.addScriptToEvaluateOnNewDocument", {"source": _LOGIN_SUBMIT_GUARD}
+            )
             client.evaluate(_LOGIN_SUBMIT_GUARD)
             return client
         except Exception as exc:
@@ -758,6 +959,44 @@ def _stop_managed_browser_unlocked(account_id: int, cdp_port: int) -> bool:
             except Exception:
                 pass
     return stopped
+
+
+def stop_idle_account_browser(account: dict[str, Any], settings: Any) -> bool:
+    """Close a browser only after proving it belongs to this managed account."""
+    aid = int(account["id"])
+    port = _cdp_port(account, settings)
+    with _account_lock(aid):
+        if not _endpoint_ready(port):
+            return _stop_managed_browser_unlocked(aid, port)
+        with _managed_lock:
+            known = aid in _managed
+        if not known:
+            profile = _profile_path(account, settings)
+            root = Path(settings.chrome_user_data_root).resolve()
+            if not _managed_profile_child(profile, root):
+                raise AkoolBrowserError(
+                    "existing browser is not owned by this managed account"
+                )
+            expected_profile = f"--user-data-dir={profile}"
+            expected_port = f"--remote-debugging-port={port}"
+            owned = False
+            for process in Path("/proc").glob("[0-9]*"):
+                try:
+                    args = [
+                        os.fsdecode(value)
+                        for value in (process / "cmdline").read_bytes().split(b"\0")
+                        if value
+                    ]
+                    if expected_profile in args and expected_port in args:
+                        owned = True
+                        break
+                except OSError:
+                    continue
+            if not owned:
+                raise AkoolBrowserError(
+                    "existing browser ownership could not be confirmed"
+                )
+        return _stop_managed_browser_unlocked(aid, port)
 
 
 def stop_managed_browser(account_id: int, cdp_port: int) -> bool:

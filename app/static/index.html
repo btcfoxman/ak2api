@@ -5,9 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" href="data:,">
   <title>AK2API Console</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20260915-1">
+  <link rel="stylesheet" href="/static/styles.css?v=20261108-online-1">
   <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
-  <script src="/static/app.js?v=20260915-1" defer></script>
+  <script src="/static/app.js?v=20261108-online-1" defer></script>
+  <script src="/static/account-login.js?v=20261108-online-1" defer></script>
   <script src="/static/browser-assist.js?v=20260915-1" defer></script>
 </head>
 <body>
@@ -19,6 +20,7 @@
       </div>
       <nav class="mast-actions" aria-label="主要操作">
         <button class="button primary" id="newTaskButton" type="button"><i data-lucide="sparkles"></i><span>测试调用</span></button>
+        <button class="button" id="onlineAddAccountButton" type="button" aria-label="在线添加账号"><i data-lucide="monitor-up"></i><span>在线添加账号</span></button>
         <button class="button" id="addAccountButton" type="button"><i data-lucide="user-plus"></i><span>账号</span></button>
         <button class="button" id="batchButton" type="button"><i data-lucide="users"></i><span>批量导入</span></button>
         <button class="icon-button" id="settingsButton" type="button" title="运行设置"><i data-lucide="settings"></i></button>
@@ -64,6 +66,25 @@
       </div>
     </section>
   </main>
+
+  <dialog id="onlineAccountDialog" class="online-account-dialog" aria-labelledby="onlineAccountTitle">
+    <div class="online-account-layout">
+      <header class="online-account-header"><div><p class="eyebrow">账号登录</p><h2 id="onlineAccountTitle">在线添加账号</h2><p id="onlineAccountIdentity" class="caption">登录会话与任务保持同步</p></div><button class="icon-button" id="onlineAccountClose" type="button" aria-label="关闭在线登录"><i data-lucide="x"></i></button></header>
+      <form id="onlineAccountForm" class="online-account-fields">
+        <div id="onlineAccountFields" class="form-grid">
+          <label>账号名称<input name="name" required maxlength="120" autocomplete="off" placeholder="给这个账号起个名称"></label>
+          <label>并发上限<input name="max_concurrency" type="number" min="1" max="100" value="8" required></label>
+          <label class="wide">账号代理<input name="proxy_url" class="mono" maxlength="500" autocomplete="off" spellcheck="false" placeholder="留空时按代理池设置分配"></label>
+          <label class="check wide"><input name="use_proxy_pool" type="checkbox" checked>未填写代理时使用代理池</label>
+          <button class="button primary" id="onlineAccountCreate" type="submit"><i data-lucide="monitor-up"></i><span>创建并打开网页登录</span></button>
+        </div>
+      </form>
+      <div class="online-account-notice"><span class="browser-live-dot"></span><p id="onlineAccountMessage" role="status" aria-live="polite">在账号网页完成登录，再点击“完成登录并验证”。</p></div>
+      <iframe id="onlineAccountFrame" title="账号网页登录窗口" src="about:blank" allow="clipboard-read; clipboard-write" referrerpolicy="no-referrer" hidden></iframe>
+      <div id="onlineAccountPlaceholder" class="online-account-placeholder"><i data-lucide="monitor"></i><p>浏览器将在这里打开</p><span>登录成功后验证身份，并自动同步会话。</span></div>
+      <footer class="online-account-footer"><span class="caption">关闭后释放操作窗口，保留账号浏览器会话。</span><div class="section-actions"><button class="button" id="onlineAccountCancel" type="button">关闭窗口</button><button class="button primary" id="onlineAccountFinish" type="button" hidden><i data-lucide="shield-check"></i><span>完成登录并验证</span></button></div></footer>
+    </div>
+  </dialog>
 
   <dialog id="accountDialog"><form class="dialog-form" id="accountForm">
     <header><div><p class="eyebrow">ACCOUNT</p><h2>添加或更新账号</h2></div><button class="icon-button close" type="button"><i data-lucide="x"></i></button></header>

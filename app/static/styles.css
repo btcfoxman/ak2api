@@ -475,6 +475,37 @@ textarea { resize: vertical; }
 .login-card .brand-mark { margin-bottom: 10px; }
 .login-card h1 { margin-bottom: 16px; }
 .login-card button { width: 100%; margin-top: 10px; min-height: 34px; border: 1px solid #329f7d; border-radius: 3px; background: #17634f; color: white; }
+.task-account-login { display: inline-flex; align-items: center; gap: 5px; margin-top: 5px; padding: 3px 6px; border: 1px solid #355d50; border-radius: 3px; background: #152720; color: var(--mint); font-size: 10px; line-height: 1.3; white-space: nowrap; }
+.task-account-login svg { width: 12px; height: 12px; }
+.task-account-login:hover:not(:disabled) { border-color: var(--mint); background: #1b352b; }
+.task-account-login:disabled { opacity: .42; cursor: default; border-color: var(--line); background: var(--surface); color: var(--muted); }
+.online-account-dialog { position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh; max-width: none; max-height: none; margin: 0; padding: 0; overflow: hidden; border: 0; border-radius: 0; background: var(--bg); box-shadow: none; }
+.online-account-layout { display: flex; flex-direction: column; gap: 8px; width: 100%; height: 100%; min-height: 0; padding: 12px; }
+.online-account-header, .online-account-footer { display: flex; flex: none; align-items: center; justify-content: space-between; gap: 12px; }
+.online-account-header { padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+.online-account-header h2 { margin: 3px 0 5px; font-size: 19px; }
+.online-account-fields { flex: none; }
+.online-account-fields .form-grid { grid-template-columns: minmax(0, 1fr) 150px; gap: 9px; padding: 10px; background: var(--surface); border: 1px solid var(--line-soft); }
+.online-account-fields button { grid-column: 1 / -1; justify-self: start; }
+.online-account-notice { display: flex; flex: none; align-items: center; gap: 10px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 3px; background: var(--surface-2); }
+#onlineAccountMessage { color: var(--text); line-height: 1.6; }
+#onlineAccountFrame { display: block; flex: 1; min-width: 0; min-height: 0; width: 100%; border: 1px solid var(--line); border-radius: 3px; background: #080a0b; }
+.online-account-placeholder { display: grid; flex: 1; min-height: 90px; align-content: center; justify-items: center; gap: 10px; color: var(--muted); border: 1px dashed var(--line); background: var(--surface); }
+.online-account-placeholder svg { width: 34px; height: 34px; color: var(--mint); }
+.online-account-placeholder p { color: var(--text); font-size: 14px; }
+.online-account-placeholder span { max-width: 100%; padding: 0 12px; text-align: center; }
+.online-account-footer { padding-top: 4px; }
+.online-account-dialog[aria-busy="true"] .browser-live-dot { animation: account-login-pulse 1.4s ease-in-out infinite; }
+@keyframes account-login-pulse { 50% { opacity: .4; } }
+@media (prefers-reduced-motion: reduce) { .online-account-dialog[aria-busy="true"] .browser-live-dot { animation: none; } }
+@media (max-width: 620px) {
+  .online-account-layout { padding: 8px; gap: 6px; }
+  .online-account-fields .form-grid { grid-template-columns: minmax(0, 1fr) 110px; }
+  .online-account-fields label.wide { grid-column: 1 / -1; }
+  .online-account-footer > .caption { display: none; }
+  .online-account-footer { justify-content: flex-end; }
+  #onlineAccountDialog .button span { display: inline; }
+}
 @media (max-width: 1180px) {
   .account-settings-card, .browser-settings-card { grid-column: span 6; }
   .proxy-settings-card { grid-column: 1 / -1; }

@@ -1,0 +1,116 @@
+name: Pre-production Docker
+
+on:
+  push:
+    branches: [pre]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ak2api-pre-production
+  cancel-in-progress: false
+
+env:
+  IMAGE_REF: ghcr.io/btcfoxman/ak2api
+
+jobs:
+  build:
+    name: Test and build on GitHub
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+      image_size: ${{ steps.publish.outputs.image_size }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Complete application and UI checks
+        run: |
+          python -m pip install -r requirements.txt pytest httpx
+          python -m pytest -q
+          node --test tests/test_online_account_ui.mjs
+          node --check app/static/app.js
+          node --check app/static/account-login.js
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build candidate only on hosted runner
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE_REF }}:${{ github.sha }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+      - name: Real Chrome and authenticated VNC smoke without external network
+        run: python scripts/verify_online_login_image.py --image "${IMAGE_REF}:${GITHUB_SHA}"
+      - name: Publish validated immutable image
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${IMAGE_REF}:${GITHUB_SHA}"
+          docker push "$image"
+          docker tag "$image" "${IMAGE_REF}:latest"
+          docker push "${IMAGE_REF}:latest"
+          digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "$image")"
+          digest="${digest##*@}"
+          test "${digest#sha256:}" != "$digest"
+          image_size="$(docker image inspect --format '{{.Size}}' "$image")"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "image_size=$image_size" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Pull verified image and switch when idle
+    needs: build
+    runs-on: [self-hosted, linux, x64, ak2api-pre]
+    timeout-minutes: 60
+    env:
+      DEPLOY_PATH: /home/btcfoxman/docker/ak2api
+      DEPLOY_SERVICE: ak2api
+      DOCKER_CONFIG: ${{ runner.temp }}/ak-registry-${{ github.run_id }}
+      IMAGE_DIGEST: ${{ needs.build.outputs.digest }}
+      IMAGE_SIZE: ${{ needs.build.outputs.image_size }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compare direct and configured proxy then import immutable image
+        run: >-
+          python3 scripts/pull_verified_image.py
+          --image "${IMAGE_REF}:${GITHUB_SHA}"
+          --digest "$IMAGE_DIGEST"
+          --image-size "$IMAGE_SIZE"
+          --deploy-path "$DEPLOY_PATH"
+      - name: Preserve data and configuration and switch only when idle
+        run: >-
+          python3 scripts/deploy_pre.py
+          --image "${IMAGE_REF}:${GITHUB_SHA}"
+          --revision "$GITHUB_SHA"
+          --deploy-path "$DEPLOY_PATH"
+      - name: Keep the existing startup command on the validated local release
+        run: docker tag "${IMAGE_REF}:${GITHUB_SHA}" "${IMAGE_REF}:latest"
+      - name: Check existing public tunnel endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --noproxy '*' --fail --silent --show-error --retry 3 --retry-delay 3 --connect-timeout 5 --max-time 15 https://ak2api.aiid.edu.kg/health >/dev/null

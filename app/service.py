@@ -44,7 +44,6 @@ from app.model_catalog import (
     public_models,
 )
 
-
 LOGGER = logging.getLogger("ak2api.service")
 TERMINAL_STATUSES = {"succeeded", "failed", "expired"}
 TEXT_VIDEO_IMAGE_CACHE_KEY = "text_to_video_black_1024_v1"
@@ -68,9 +67,7 @@ def _is_moderation_failure(message: Any) -> bool:
 
 def _is_image_constraint_failure(message: Any) -> bool:
     value = str(message or "").lower()
-    return (
-        "height" in value and "300" in value and "6000" in value
-    ) or (
+    return ("height" in value and "300" in value and "6000" in value) or (
         "aspect ratio" in value and "0.4" in value and "2.5" in value
     )
 
@@ -160,7 +157,9 @@ class AKService:
         )
         self._slots = _DynamicSlots(int(settings.task_workers))
         self._login_slots = _DynamicSlots(int(settings.browser_login_workers))
-        self._maintenance_slots = _DynamicSlots(int(settings.account_maintenance_workers))
+        self._maintenance_slots = _DynamicSlots(
+            int(settings.account_maintenance_workers)
+        )
         self._futures: dict[str, Future[Any]] = {}
         self._future_lock = threading.RLock()
         self._task_submit_lock = threading.RLock()
@@ -170,6 +169,8 @@ class AKService:
         self._active_maintenance: set[int] = set()
         self._resetting_profiles: set[int] = set()
         self._manual_browser_leases: dict[int, float] = {}
+        self._manual_browser_sessions: dict[int, dict[str, Any]] = {}
+        self._online_browser_accounts: set[int] = set()
         self._text_video_image_locks: dict[int, threading.Lock] = {}
         self._stop = threading.Event()
         self._maintenance_wakeup = threading.Event()
@@ -177,6 +178,7 @@ class AKService:
 
     def start(self) -> None:
         self._stop.clear()
+        self.db.clear_maintenance_leases()
         self._maintenance_wakeup.clear()
         for task in self.db.recoverable_tasks():
             self._schedule(str(task["id"]))
@@ -316,7 +318,9 @@ class AKService:
             if len(parts) == 2 and self._looks_like_proxy(password):
                 proxy_url, password = password, ""
             if not email:
-                errors.append({"line": str(line_number), "message": "email is required"})
+                errors.append(
+                    {"line": str(line_number), "message": "email is required"}
+                )
                 continue
             if len(parts) > 3:
                 errors.append(
@@ -358,9 +362,45 @@ class AKService:
             ]
         return value
 
-    def upsert_account(self, payload: dict[str, Any], *, start_login: bool = False) -> dict[str, Any]:
+    def upsert_account(
+        self, payload: dict[str, Any], *, start_login: bool = False
+    ) -> dict[str, Any]:
         value = self._account_payload(payload)
         with self._account_guard:
+            existing = self.db.find_account_by_identity(value)
+            if existing and (
+                int(existing.get("active_tasks") or 0)
+                or self._manual_browser_active(int(existing["id"]))
+                or int(existing["id"])
+                in (
+                    self._running_logins
+                    | self._running_maintenance
+                    | self._resetting_profiles
+                )
+            ):
+                raise ValueError(
+                    "account session is busy; finish active work before importing a replacement"
+                )
+            if (
+                existing
+                and existing.get("session_mode") == "managed_profile"
+                and any(
+                    value.get(key)
+                    for key in (
+                        "cookies",
+                        "cookie_header",
+                        "cookie_records",
+                        "access_token",
+                        "token",
+                        "proxy_url",
+                        "profile_dir",
+                        "cdp_port",
+                    )
+                )
+            ):
+                raise ValueError(
+                    "managed account session must be updated through its online login window"
+                )
             if not str(value.get("proxy_url") or "").strip() and bool(
                 value.pop("use_proxy_pool", True)
             ):
@@ -377,7 +417,10 @@ class AKService:
         try:
             return self.check_account(int(account["id"]), recover=False)
         except Exception:
-            return self.db.get_account(int(account["id"]), include_secrets=False) or account
+            return (
+                self.db.get_account(int(account["id"]), include_secrets=False)
+                or account
+            )
 
     def batch_import(
         self,
@@ -401,7 +444,9 @@ class AKService:
         for item in raw_accounts:
             identity = self._identity_key(item)
             if not identity:
-                errors.append({"line": "", "message": "account name or email is required"})
+                errors.append(
+                    {"line": "", "message": "account name or email is required"}
+                )
                 continue
             if identity in identity_indexes:
                 current = values[identity_indexes[identity]]
@@ -414,7 +459,11 @@ class AKService:
             identity_indexes[identity] = len(values)
             values.append(dict(item))
 
-        pool = self._proxy_values() if use_proxy_pool and self.settings.proxy_pool_enabled else []
+        pool = (
+            self._proxy_values()
+            if use_proxy_pool and self.settings.proxy_pool_enabled
+            else []
+        )
         counts = Counter(self.db.proxy_assignment_counts())
         existing_count = 0
         for item in values:
@@ -431,7 +480,9 @@ class AKService:
             if existing:
                 continue
             if pool:
-                selected = min(pool, key=lambda proxy: (counts[proxy], pool.index(proxy)))
+                selected = min(
+                    pool, key=lambda proxy: (counts[proxy], pool.index(proxy))
+                )
                 item["proxy_url"] = selected
                 counts[selected] += 1
 
@@ -456,13 +507,64 @@ class AKService:
             "errors": errors,
         }
 
-    def update_account(self, account_id: int, changes: dict[str, Any]) -> dict[str, Any]:
+    def update_account(
+        self, account_id: int, changes: dict[str, Any]
+    ) -> dict[str, Any]:
+        # Account dispatch uses this same guard: bindings cannot change between
+        # checking the idle state and atomically saving the new configuration.
+        with self._account_guard:
+            return self._update_account_locked(account_id, changes)
+
+    def _update_account_locked(
+        self, account_id: int, changes: dict[str, Any]
+    ) -> dict[str, Any]:
         before = self.db.get_account(account_id)
         if not before:
             raise KeyError("account not found")
         value = self._account_payload(changes)
+        binding_fields = {
+            "proxy_url",
+            "profile_dir",
+            "cdp_port",
+            "email",
+            "user_id",
+            "team_id",
+            "cookie_header",
+            "cookies",
+            "cookie_records",
+            "access_token",
+            "password",
+            "user_agent",
+            "sec_ch_ua",
+            "sec_ch_ua_platform",
+        }
+        if set(value) & binding_fields:
+            with self._account_guard:
+                if (
+                    int(before.get("active_tasks") or 0)
+                    or self._manual_browser_active(account_id)
+                    or account_id
+                    in (
+                        self._running_logins
+                        | self._running_maintenance
+                        | self._resetting_profiles
+                        | self._online_browser_accounts
+                    )
+                ):
+                    raise ValueError(
+                        "account browser/session is busy; finish active work before changing its binding"
+                    )
+            if before.get("session_mode") == "managed_profile" and set(value) & (
+                binding_fields - {"password"}
+            ):
+                raise ValueError(
+                    "managed account session binding must be updated through its login window or profile reset"
+                )
         if value.get("enabled") is False:
-            stop_managed_browser(account_id, int(before.get("cdp_port") or 0))
+            if not int(
+                before.get("active_tasks") or 0
+            ) and not self._manual_browser_active(account_id):
+                stop_managed_browser(account_id, int(before.get("cdp_port") or 0))
             value.setdefault("status", "disabled")
         elif value.get("enabled") is True and before.get("status") in {
             "disabled",
@@ -477,6 +579,10 @@ class AKService:
         return self.db.get_account(account_id, include_secrets=False) or account
 
     def delete_account(self, account_id: int) -> bool:
+        with self._account_guard:
+            return self._delete_account_locked(account_id)
+
+    def _delete_account_locked(self, account_id: int) -> bool:
         account = self.db.get_account(account_id)
         if not account:
             return False
@@ -521,13 +627,17 @@ class AKService:
                 raise ValueError("account profile reset is already in progress")
             self._resetting_profiles.add(account_id)
         previous_status = str(account.get("status") or "login_required")
-        self.db.update_account(account_id, {"status": "profile_resetting", "last_error": ""})
+        self.db.update_account(
+            account_id, {"status": "profile_resetting", "last_error": ""}
+        )
         try:
             current_proxy = normalize_proxy_url(str(account.get("proxy_url") or ""))
             if use_proxy_pool:
                 selected_proxy = self._assign_proxy(exclude_proxy=current_proxy)
                 if not selected_proxy:
-                    raise ValueError("proxy pool is disabled, empty, or has no alternate proxy")
+                    raise ValueError(
+                        "proxy pool is disabled, empty, or has no alternate proxy"
+                    )
             elif proxy_url is None:
                 selected_proxy = current_proxy
             else:
@@ -549,12 +659,18 @@ class AKService:
                     "status": "login_pending" if start_login else "login_required",
                     "last_error": "",
                     "last_login_at": None,
+                    "session_mode": "",
+                    "browser_binding_json": {},
+                    "session_source": "profile_reset",
                 },
             )
         except Exception as exc:
             self.db.update_account(
                 account_id,
-                {"status": previous_status, "last_error": f"profile reset failed: {exc}"},
+                {
+                    "status": previous_status,
+                    "last_error": f"profile reset failed: {exc}",
+                },
             )
             raise
         finally:
@@ -562,29 +678,60 @@ class AKService:
                 self._resetting_profiles.discard(account_id)
         login_started = self.schedule_login(account_id) if start_login else False
         return {
-            "account": self.db.get_account(account_id, include_secrets=False) or updated or {},
+            "account": self.db.get_account(account_id, include_secrets=False)
+            or updated
+            or {},
             "profile_reset": profile,
             "login_started": login_started,
         }
 
     def _manual_browser_active(self, account_id: int) -> bool:
         with self._account_guard:
+            if int(account_id) in self._online_browser_accounts:
+                return True
             deadline = self._manual_browser_leases.get(int(account_id), 0)
             if deadline > time.monotonic():
                 return True
             self._manual_browser_leases.pop(int(account_id), None)
+            lease = self._manual_browser_sessions.pop(int(account_id), None)
+            if lease:
+                previous = lease["previous"]
+                self.db.release_browser_login(
+                    account_id,
+                    lease["id"],
+                    enabled=False,
+                    status=(
+                        previous["status"]
+                        if not previous.get("enabled")
+                        else "login_required"
+                    ),
+                    error="manual login window expired before a verified session was saved",
+                )
             return False
 
     def open_manual_browser(self, account_id: int) -> dict[str, Any]:
         with self._account_guard:
+            if account_id in self._online_browser_accounts:
+                raise ValueError("account online login is already open")
             account = self.db.get_account(account_id)
             if not account:
                 raise KeyError("account not found")
             if account_id in self._running_logins:
                 raise ValueError("登录仍在进行，出现需验证或登录结束后可打开人工验证")
-            if (account_id in self._running_maintenance or account_id in self._resetting_profiles
-                    or account.get("active_tasks")):
+            if (
+                account_id in self._running_maintenance
+                or account_id in self._resetting_profiles
+                or account.get("active_tasks")
+            ):
                 raise ValueError("账号正在执行任务或维护，请稍后打开人工验证")
+            sid = "manual-" + uuid.uuid4().hex
+            previous = self.db.claim_browser_login(
+                account_id, sid, int(time.time()) + 120
+            )
+            self._manual_browser_sessions[account_id] = {
+                "id": sid,
+                "previous": previous,
+            }
             self._manual_browser_leases[account_id] = time.monotonic() + 120
         try:
             return browser_snapshot(account, self.settings, start=True)
@@ -600,18 +747,25 @@ class AKService:
             if not account:
                 raise KeyError("account not found")
             self._manual_browser_leases[account_id] = time.monotonic() + 120
+            self.db.update_account(
+                account_id, {"login_lease_until": int(time.time()) + 120}
+            )
             return account
 
     def manual_browser_snapshot(self, account_id: int) -> dict[str, Any]:
         return browser_snapshot(self._manual_browser_account(account_id), self.settings)
 
-    def manual_browser_action(self, account_id: int, action: dict[str, Any]) -> dict[str, Any]:
-        return browser_action(self._manual_browser_account(account_id), self.settings, action)
+    def manual_browser_action(
+        self, account_id: int, action: dict[str, Any]
+    ) -> dict[str, Any]:
+        return browser_action(
+            self._manual_browser_account(account_id), self.settings, action
+        )
 
     def complete_manual_browser(self, account_id: int) -> dict[str, Any]:
         account = self._manual_browser_account(account_id)
         context = capture_browser_session(account, self.settings)
-        self.db.update_account(account_id, context)
+        self._persist_browser_context(account, context)
         result = self.check_account(account_id, recover=False)
         self.close_manual_browser(account_id)
         return result
@@ -619,22 +773,69 @@ class AKService:
     def close_manual_browser(self, account_id: int) -> None:
         with self._account_guard:
             self._manual_browser_leases.pop(account_id, None)
+            lease = self._manual_browser_sessions.pop(account_id, None)
+            if lease:
+                previous = lease["previous"]
+                current = self.db.get_account(account_id) or {}
+                verified = False
+                try:
+                    context = capture_browser_session(current, self.settings)
+                    self._persist_browser_context(current, context)
+                    verified = True
+                except Exception:
+                    pass
+                enabled = verified and bool(
+                    previous.get("enabled") and current.get("enabled")
+                )
+                self.db.release_browser_login(
+                    account_id,
+                    lease["id"],
+                    enabled=enabled,
+                    status=(
+                        "active"
+                        if enabled
+                        else (
+                            previous["status"]
+                            if not previous.get("enabled")
+                            else "login_required"
+                        )
+                    ),
+                    error=(
+                        ""
+                        if verified
+                        else "manual login closed without a verified matching session"
+                    ),
+                )
 
     def schedule_login(self, account_id: int) -> bool:
         account_id = int(account_id)
         with self._account_guard:
-            if account_id in self._running_logins or self._manual_browser_active(account_id):
+            if (
+                account_id in self._running_logins
+                or self._manual_browser_active(account_id)
+                or account_id
+                in (
+                    self._online_browser_accounts
+                    | self._running_maintenance
+                    | self._resetting_profiles
+                )
+            ):
                 return False
-            if not self.db.get_account(account_id, include_secrets=False):
+            current = self.db.get_account(account_id, include_secrets=False)
+            if not current or int(current.get("active_tasks") or 0):
                 return False
             self._running_logins.add(account_id)
-            self.db.update_account(account_id, {"status": "login_pending", "last_error": ""})
+            self.db.update_account(
+                account_id, {"status": "login_pending", "last_error": ""}
+            )
             try:
                 future = self._logins.submit(self._login_account, account_id)
             except Exception:
                 self._running_logins.discard(account_id)
                 raise
-        future.add_done_callback(lambda _future, value=account_id: self._finish_login(value))
+        future.add_done_callback(
+            lambda _future, value=account_id: self._finish_login(value)
+        )
         return True
 
     def _finish_login(self, account_id: int) -> None:
@@ -650,9 +851,17 @@ class AKService:
             account = self.db.get_account(account_id)
             if not account:
                 raise KeyError("account not found")
-            self.db.update_account(account_id, {"status": "logging_in", "last_error": ""})
+            if (
+                int(account.get("active_tasks") or 0)
+                or self._manual_browser_active(account_id)
+                or account_id in self._online_browser_accounts
+            ):
+                raise ValueError("account browser/session is busy")
+            self.db.update_account(
+                account_id, {"status": "logging_in", "last_error": ""}
+            )
             context = refresh_account_context(account, self.settings)
-            self.db.update_account(account_id, context)
+            self._persist_browser_context(account, context)
             return self.check_account(account_id, recover=False)
         except Exception as exc:
             if isinstance(exc, (AkoolAccountSuspended, AkoolBrowserAccountSuspended)):
@@ -685,8 +894,36 @@ class AKService:
             context = refresh_account_context(account, self.settings)
         except AkoolBrowserAccountSuspended as exc:
             raise AkoolAccountSuspended() from exc
-        updated = self.db.update_account(int(account["id"]), context) or account
-        return AkoolClient(updated, self.settings)
+        updated = self._persist_browser_context(account, context)
+        return self._client(updated)
+
+    def _client(self, account: dict[str, Any]) -> AkoolClient:
+        client = AkoolClient(account, self.settings)
+        setter = getattr(client, "set_session_callbacks", None)
+        if setter:
+            account_id = int(account["id"])
+            setter(
+                lambda: self.db.get_account(account_id),
+                lambda context, revision: self.db.apply_browser_context(
+                    account_id,
+                    context,
+                    expected_revision=revision,
+                    source="native_request",
+                ),
+            )
+        return client
+
+    def _persist_browser_context(
+        self, account: dict[str, Any], context: dict[str, Any]
+    ) -> dict[str, Any]:
+        if context.get("session_mode") != "managed_profile":
+            return self.db.update_account(int(account["id"]), context) or account
+        updated = self.db.apply_browser_context(
+            int(account["id"]),
+            context,
+            expected_revision=int(account.get("session_revision") or 0),
+        )
+        return updated or self.db.get_account(int(account["id"])) or account
 
     def _with_recovery(
         self,
@@ -712,10 +949,12 @@ class AKService:
         account = self.db.get_account(account_id)
         if not account:
             raise KeyError("account not found")
-        client = AkoolClient(account, self.settings)
+        client = self._client(account)
         try:
             if recover:
-                state, client = self._with_recovery(account, client, lambda item: item.account_state())
+                state, client = self._with_recovery(
+                    account, client, lambda item: item.account_state()
+                )
             else:
                 state = client.account_state()
             updated = self._store_account_state(account_id, account, state)
@@ -728,14 +967,20 @@ class AKService:
                 self.db.disable_account_for_low_balance_if_idle(
                     account_id, float(self.settings.low_balance_disable_threshold)
                 )
-            return self.db.get_account(account_id, include_secrets=False) or updated or {}
+            return (
+                self.db.get_account(account_id, include_secrets=False) or updated or {}
+            )
         except Exception as exc:
             if isinstance(exc, (AkoolAccountSuspended, AkoolBrowserAccountSuspended)):
                 self._mark_account_suspended(account_id)
                 raise
-            status = "login_required" if isinstance(
-                exc, (AkoolAuthError, AkoolRiskBlocked, AkoolBrowserError)
-            ) else "network_error"
+            status = (
+                "login_required"
+                if isinstance(
+                    exc, (AkoolAuthError, AkoolRiskBlocked, AkoolBrowserError)
+                )
+                else "network_error"
+            )
             self.db.update_account(
                 account_id,
                 {"status": status, "last_error": str(exc), "last_checked_at": now_ts()},
@@ -763,23 +1008,69 @@ class AKService:
         account: dict[str, Any],
         state: dict[str, Any],
     ) -> dict[str, Any] | None:
-        return self.db.update_account(
-            account_id,
-            {
-                "email": state.get("email") or account.get("email") or "",
-                "user_id": state.get("user_id") or account.get("user_id") or "",
-                "team_id": state.get("team_id") or account.get("team_id") or "",
-                "access_token": state.get("token") or account.get("access_token") or "",
-                "last_balance": state.get("available_balance"),
-                "balance_details": state.get("buckets") or {},
-                "plan": state.get("plan") or "",
-                "status": "active",
-                "last_error": "",
-                "last_checked_at": now_ts(),
-            },
-        )
+        current = self.db.get_account(account_id) or account
+        if (
+            current.get("email")
+            and state.get("email")
+            and str(current["email"]).strip().casefold()
+            != str(state["email"]).strip().casefold()
+        ):
+            raise AkoolAuthError("verified Akool account identity changed")
+        if (
+            current.get("user_id")
+            and state.get("user_id")
+            and str(current["user_id"]) != str(state["user_id"])
+        ):
+            raise AkoolAuthError("verified Akool user id changed")
+        changes = {
+            "last_balance": state.get("available_balance"),
+            "balance_details": state.get("buckets") or {},
+            "plan": state.get("plan") or "",
+            "status": "active",
+            "last_error": "",
+            "last_checked_at": now_ts(),
+        }
+        if current.get("session_mode") != "managed_profile":
+            changes.update(
+                email=state.get("email") or current.get("email") or "",
+                user_id=state.get("user_id") or current.get("user_id") or "",
+                team_id=state.get("team_id") or current.get("team_id") or "",
+                access_token=state.get("token") or current.get("access_token") or "",
+            )
+        return self.db.update_account(account_id, changes)
 
-    def create_task(self, payload: dict[str, Any], *, caller_request: dict[str, Any] | None = None) -> dict[str, Any]:
+    def begin_online_login(
+        self, account_id: int, session_id: str, expires_at: int
+    ) -> dict[str, Any]:
+        with self._account_guard:
+            if self._manual_browser_active(account_id) or account_id in (
+                self._running_logins
+                | self._running_maintenance
+                | self._resetting_profiles
+            ):
+                raise ValueError("account login or maintenance is already in progress")
+            previous = self.db.claim_browser_login(account_id, session_id, expires_at)
+            self._online_browser_accounts.add(int(account_id))
+            return previous
+
+    def end_online_login(
+        self,
+        account_id: int,
+        session_id: str,
+        *,
+        enabled: bool,
+        status: str,
+        error: str = "",
+    ) -> None:
+        with self._account_guard:
+            self.db.release_browser_login(
+                account_id, session_id, enabled=enabled, status=status, error=error
+            )
+            self._online_browser_accounts.discard(int(account_id))
+
+    def create_task(
+        self, payload: dict[str, Any], *, caller_request: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         with self._task_submit_lock:
             capacity = max(int(self.settings.task_queue_capacity), 0)
             maximum_active = int(self.settings.task_workers) + capacity
@@ -795,9 +1086,8 @@ class AKService:
                 self.settings.excess_media_policy,
                 bool(self.settings.prompt_media_reference_cleanup_enabled),
             )
-            if (
-                normalized.get("_videos")
-                and not bool(self.settings.allow_video_reference_inputs)
+            if normalized.get("_videos") and not bool(
+                self.settings.allow_video_reference_inputs
             ):
                 raise ValueError(
                     "video reference inputs are disabled by the channel setting"
@@ -854,9 +1144,19 @@ class AKService:
         reservation = 0 if recovering else float(task.get("estimated_cost") or 0)
         while time.monotonic() < deadline:
             with self._account_guard:
-                manual = {key for key in list(self._manual_browser_leases)
-                          if self._manual_browser_active(key)}
-                unavailable = excluded | set(self._active_maintenance) | manual
+                manual = {
+                    key
+                    for key in list(self._manual_browser_leases)
+                    if self._manual_browser_active(key)
+                }
+                unavailable = (
+                    excluded
+                    | set(self._active_maintenance)
+                    | manual
+                    | self._running_logins
+                    | self._resetting_profiles
+                    | self._online_browser_accounts
+                )
                 account = self.db.acquire_account(
                     int(preferred) if preferred else None,
                     exclude_ids=unavailable,
@@ -881,10 +1181,14 @@ class AKService:
                     code="NO_AVAILABLE_ACCOUNT",
                     status_code=503,
                 )
-            if reservation > 0 and self.db.available_account_count(
-                excluded,
-                minimum_balance=reservation,
-            ) <= 0:
+            if (
+                reservation > 0
+                and self.db.available_account_count(
+                    excluded,
+                    minimum_balance=reservation,
+                )
+                <= 0
+            ):
                 raise AkoolUpstreamError(
                     "no active Akool account has enough available credit for this task",
                     code="INSUFFICIENT_CREDITS",
@@ -1058,7 +1362,7 @@ class AKService:
             while account is None:
                 account = self._acquire_task_account(task, deadline, excluded_ids)
                 account_id = int(account["id"])
-                client = AkoolClient(account, self.settings)
+                client = self._client(account)
                 before_balance = (
                     float(account["last_balance"])
                     if account.get("last_balance") is not None
@@ -1114,9 +1418,7 @@ class AKService:
                             ),
                         )
                         uploads.append(upload)
-                        progress = 5 + int(
-                            ((index + 1) / max(len(sources), 1)) * 25
-                        )
+                        progress = 5 + int(((index + 1) / max(len(sources), 1)) * 25)
                         self.db.update_task(task_id, progress=progress)
                     if needs_text_video_image:
                         upload, client = self._with_recovery(
@@ -1214,7 +1516,9 @@ class AKService:
 
                 try:
                     generated, client = self._with_recovery(
-                        account, client, lambda current: current.generate(upstream_request)
+                        account,
+                        client,
+                        lambda current: current.generate(upstream_request),
                     )
                 except AkoolUpstreamError as exc:
                     if isinstance(exc, AkoolAccountSuspended):
@@ -1262,12 +1566,15 @@ class AKService:
             while time.monotonic() < deadline:
                 try:
                     detail, client = self._with_recovery(
-                        account, client, lambda current: current.generation_detail(generation_id)
+                        account,
+                        client,
+                        lambda current: current.generation_detail(generation_id),
                     )
                 except AkoolUpstreamError as exc:
                     if not (
                         exc.status_code == 429
-                        or exc.code in {"RATE_LIMITED", "NETWORK_ERROR", "AKOOL_HTTP_ERROR"}
+                        or exc.code
+                        in {"RATE_LIMITED", "NETWORK_ERROR", "AKOOL_HTTP_ERROR"}
                         or is_rate_limit_message(exc)
                     ):
                         raise
@@ -1296,7 +1603,9 @@ class AKService:
                         status="running",
                         upstream_response={"attempts": attempts[-30:]},
                     )
-                    LOGGER.info("task %s polling delayed by %.1fs: %s", task_id, delay, exc)
+                    LOGGER.info(
+                        "task %s polling delayed by %.1fs: %s", task_id, delay, exc
+                    )
                     time.sleep(min(delay, max(deadline - time.monotonic(), 0)))
                     continue
                 poll_errors = 0
@@ -1333,7 +1642,9 @@ class AKService:
                         )
                         balance_fresh = True
                     except Exception as exc:
-                        LOGGER.warning("balance refresh failed after %s: %s", task_id, exc)
+                        LOGGER.warning(
+                            "balance refresh failed after %s: %s", task_id, exc
+                        )
                         if isinstance(
                             exc,
                             (AkoolAccountSuspended, AkoolBrowserAccountSuspended),
@@ -1364,7 +1675,8 @@ class AKService:
                     account = None
                     if balance_fresh:
                         self.db.disable_account_for_low_balance_if_idle(
-                            account_id, float(self.settings.low_balance_disable_threshold)
+                            account_id,
+                            float(self.settings.low_balance_disable_threshold),
                         )
                     return
                 if status == "FAILED":
@@ -1506,7 +1818,11 @@ class AKService:
             ):
                 self.db.update_account(
                     int(account["id"]),
-                    {"status": "login_required", "last_error": str(exc), "last_checked_at": now_ts()},
+                    {
+                        "status": "login_required",
+                        "last_error": str(exc),
+                        "last_checked_at": now_ts(),
+                    },
                 )
             elif account:
                 try:
@@ -1565,7 +1881,9 @@ class AKService:
         return self.db.get_task(task_id) or {}
 
     def wait_task(self, task_id: str, timeout: int | None = None) -> dict[str, Any]:
-        deadline = time.monotonic() + int(timeout or self.settings.synchronous_timeout_seconds)
+        deadline = time.monotonic() + int(
+            timeout or self.settings.synchronous_timeout_seconds
+        )
         while time.monotonic() < deadline:
             task = self.db.get_task(task_id)
             if not task:
@@ -1655,7 +1973,7 @@ class AKService:
         account = self.db.get_account(account_id, include_secrets=True)
         if not account or not account.get("enabled"):
             return
-        client = AkoolClient(account, self.settings)
+        client = self._client(account)
         stats = client.daily_checkin_status()
         self._store_daily_checkin_stats(account_id, stats)
         if bool(stats.get("today_signed")):
@@ -1707,10 +2025,7 @@ class AKService:
                 if (
                     account.get("enabled")
                     and not int(account.get("active_tasks") or 0)
-                    and (
-                        account.get("auto_login")
-                        or self._daily_checkin_due(account)
-                    )
+                    and (account.get("auto_login") or self._daily_checkin_due(account))
                 ):
                     account_id = int(account["id"])
                     with self._account_guard:
@@ -1719,18 +2034,26 @@ class AKService:
                             or account_id in self._running_maintenance
                             or account_id in self._resetting_profiles
                             or self._manual_browser_active(account_id)
+                            or account_id in self._online_browser_accounts
                         ):
                             continue
                         self._running_maintenance.add(account_id)
-                    future = self._maintenance.submit(self._maintenance_check, account_id)
+                    future = self._maintenance.submit(
+                        self._maintenance_check, account_id
+                    )
                     future.add_done_callback(
-                        lambda _future, value=account_id: self._finish_maintenance(value)
+                        lambda _future, value=account_id: self._finish_maintenance(
+                            value
+                        )
                     )
 
     def _maintenance_check(self, account_id: int) -> None:
         self._maintenance_slots.acquire()
         with self._account_guard:
             self._active_maintenance.add(int(account_id))
+            self.db.update_account(
+                account_id, {"maintenance_lease_until": now_ts() + 3600}
+            )
         try:
             current = self.db.get_account(account_id, include_secrets=False) or {}
             if not current.get("enabled") or int(current.get("active_tasks") or 0):
@@ -1743,11 +2066,9 @@ class AKService:
             if self._daily_checkin_due(account):
                 self._run_daily_checkin(account_id)
             current = self.db.get_account(account_id, include_secrets=False) or {}
-            if (
-                current.get("enabled")
-                and float(current.get("last_balance") or 0)
-                < float(self.settings.low_balance_disable_threshold)
-            ):
+            if current.get("enabled") and float(
+                current.get("last_balance") or 0
+            ) < float(self.settings.low_balance_disable_threshold):
                 self.db.disable_account_for_low_balance_if_idle(
                     account_id,
                     float(self.settings.low_balance_disable_threshold),
@@ -1761,12 +2082,15 @@ class AKService:
                 self._mark_account_suspended(account_id)
                 return
             account = self.db.get_account(account_id, include_secrets=False) or {}
-            if account.get("enabled") and account.get("auto_login") and account.get(
-                "status"
-            ) in {"login_required", "network_error"}:
+            if (
+                account.get("enabled")
+                and account.get("auto_login")
+                and account.get("status") in {"login_required", "network_error"}
+            ):
                 self.schedule_login(account_id)
         finally:
             with self._account_guard:
+                self.db.update_account(account_id, {"maintenance_lease_until": 0})
                 self._active_maintenance.discard(int(account_id))
             self._maintenance_slots.release()
 
@@ -1778,10 +2102,19 @@ class AKService:
     def status(self) -> dict[str, Any]:
         tasks = self.db.list_task_summaries(100)
         return {
+            "running_login_count": len(self._running_logins),
+            "running_maintenance_count": len(self._running_maintenance),
+            "interactive_browser_count": len(self._online_browser_accounts)
+            + sum(
+                deadline > time.monotonic()
+                for deadline in self._manual_browser_leases.values()
+            ),
             "service": "ak2api",
             "schema_version": self.settings.schema_version,
             "accounts": len(self.db.list_accounts(include_secrets=False)),
             "available_accounts": self.db.available_account_count(),
-            "running_tasks": sum(1 for item in tasks if item.get("status") not in TERMINAL_STATUSES),
+            "running_tasks": sum(
+                1 for item in tasks if item.get("status") not in TERMINAL_STATUSES
+            ),
             "task_workers": int(self.settings.task_workers),
         }

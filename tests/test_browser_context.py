@@ -164,7 +164,11 @@ def test_visible_challenge_stops_login_for_manual_verification(
     monkeypatch, tmp_path, grace, timeout
 ):
     clock = SimpleNamespace(now=0.0)
-    client = SimpleNamespace(call=lambda *args: {}, close=lambda: None)
+    client = SimpleNamespace(
+        call=lambda *args: {},
+        close=lambda: None,
+        evaluate=lambda expression: "https://akool.com/login",
+    )
     monkeypatch.setattr(browser_context.time, "monotonic", lambda: clock.now)
     monkeypatch.setattr(
         browser_context.time,

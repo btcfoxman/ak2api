@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AK2API 账号网页登录</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{display:flex;flex-direction:column;height:100vh;height:100dvh;margin:0;background:#0b0d10;color:#edf2f3;font:12px/1.4 "Bahnschrift","Microsoft YaHei UI",sans-serif}
+#status{flex:none;margin:0;padding:9px 12px;min-height:34px;border-bottom:1px solid #303940;color:#b2c3c9}
+#clipboard{display:flex;flex:none;gap:7px;align-items:center;padding:8px 12px;border-bottom:1px solid #303940;background:#12161a}
+#clipboard-text{flex:1;min-width:0;padding:8px 10px;border:1px solid #39464e;border-radius:3px;background:#191f24;color:#edf2f3;font:inherit}
+#clipboard-text:focus{outline:1px solid #55d7ad;border-color:#55d7ad}button{padding:8px 10px;border:1px solid #39464e;border-radius:3px;background:#191f24;color:#edf2f3;font:inherit;white-space:nowrap;cursor:pointer}button:disabled{opacity:.45;cursor:default}#send-text{border-color:#357d65;background:#173e31;color:#a4f3d6}#screen{flex:1;min-height:0;overflow:hidden;background:#080a0b}
+@media(max-width:600px){#clipboard{flex-wrap:wrap}#clipboard-text{flex-basis:calc(100% - 60px)}#send-text{margin-left:auto}}
+</style></head><body>
+<p id="status" role="status" aria-live="polite">正在连接账号浏览器…</p>
+<div id="clipboard">
+  <input id="clipboard-text" type="password" autocomplete="off" spellcheck="false" placeholder="在这里粘贴邮箱或密码，再发送到远端" aria-label="发送到远端的文字">
+  <button id="show-text" type="button" aria-pressed="false">显示</button>
+  <button id="send-text" type="button" disabled>发送到远端剪贴板</button>
+</div>
+<div id="screen"></div>
+<script type="module">
+const status = document.getElementById('status');
+const text = document.getElementById('clipboard-text');
+const send = document.getElementById('send-text');
+const show = document.getElementById('show-text');
+let connection;
+function clearText() {
+  text.value = '';
+  text.type = 'password';
+  show.textContent = '显示';
+  show.setAttribute('aria-pressed', 'false');
+}
+show.addEventListener('click', () => {
+  const visible = text.type === 'password';
+  text.type = visible ? 'text' : 'password';
+  show.textContent = visible ? '隐藏' : '显示';
+  show.setAttribute('aria-pressed', String(visible));
+});
+try {
+  const {default: RFB} = await import('/account-login/novnc/core/rfb.js');
+  const response = await fetch('/account-login/credentials', {credentials:'same-origin', cache:'no-store'});
+  if (!response.ok) throw new Error('登录窗口已结束，请回到管理页重新打开。');
+  const credentials = await response.json();
+  const url = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/account-login/websockify`;
+  connection = new RFB(document.getElementById('screen'), url, {credentials});
+  connection.scaleViewport = true;
+  connection.resizeSession = false;
+  send.addEventListener('click', () => {
+    if (!text.value) { status.textContent = '请先在上方输入框粘贴文字。'; return; }
+    connection.clipboardPasteFrom(text.value);
+    clearText();
+    status.textContent = '已发送到远端剪贴板；请点击远端输入框，再按 Ctrl+V。';
+  });
+  connection.addEventListener('connect', () => {
+    send.disabled = false;
+    status.textContent = '已连接。完成网页登录后，请在管理页点击“完成登录并验证”。';
+  });
+  connection.addEventListener('disconnect', () => {
+    send.disabled = true;
+    clearText();
+    status.textContent = '画面连接已结束，请查看管理页的登录结果。';
+  });
+  connection.addEventListener('securityfailure', () => {
+    send.disabled = true;
+    clearText();
+    status.textContent = '画面验证失败，请关闭登录窗口后重试。';
+  });
+} catch (error) { status.textContent = error.message; }
+window.addEventListener('pagehide', () => {
+  clearText();
+  send.disabled = true;
+  if (connection) connection.disconnect();
+}, {once:true});
+</script></body></html>

@@ -10,8 +10,9 @@ from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlencode
 
 from curl_cffi import requests as curl_requests
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -19,7 +20,6 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from app.config import normalize_proxy_url, rewrite_loopback_proxy
 from app.cookies import cookie_header_from_records, cookie_records
 from app.model_catalog import model_spec
-
 
 AKOOL_ORIGIN = "https://akool.com"
 VERIFY_PATH = "/interface/user-api/api/v6/verify/user"
@@ -29,7 +29,9 @@ DAILY_CHECKIN_PATH = "/interface/faceswap-api/api/v6/content/sign"
 SIGNATURE_PATH = "/interface/storagesvc/api/v1/upload/signature"
 PROFILE_PATH = "/interface/content-api/api/v7/content/profile/create"
 FEE_PATH = "/interface/content-api/api/v7/content/calculateFee"
-SUBMIT_PATH = "/interface/content-api/api/v7/content/image2Video/createBySourcePrompt/batch"
+SUBMIT_PATH = (
+    "/interface/content-api/api/v7/content/image2Video/createBySourcePrompt/batch"
+)
 LIST_PATH = "/interface/content-api/api/v6/content/resourceResult/list"
 IMAGE_MIN_HEIGHT = 301
 IMAGE_MAX_HEIGHT = 5999
@@ -176,7 +178,9 @@ def rate_limit_retry_after(message: str, header: Any = None) -> float | None:
             delays.append(float(header))
         except (TypeError, ValueError):
             try:
-                delays.append(parsedate_to_datetime(str(header)).timestamp() - time.time())
+                delays.append(
+                    parsedate_to_datetime(str(header)).timestamp() - time.time()
+                )
             except (TypeError, ValueError, OverflowError):
                 pass
     match = re.search(
@@ -186,7 +190,9 @@ def rate_limit_retry_after(message: str, header: Any = None) -> float | None:
     )
     if match:
         delays.append(float(match.group(1)))
-    return max((max(delay, 0) for delay in delays if math.isfinite(delay)), default=None)
+    return max(
+        (max(delay, 0) for delay in delays if math.isfinite(delay)), default=None
+    )
 
 
 @lru_cache(maxsize=1)
@@ -258,6 +264,76 @@ class AkoolClient:
             str(settings.proxy_host_override or ""),
         )
         self.session = curl_requests.Session(impersonate="chrome")
+        self._session_reader = None
+        self._session_writer = None
+
+    def set_session_callbacks(self, reader, writer) -> None:
+        self._session_reader, self._session_writer = reader, writer
+
+    def _native_request(self, method, url, payload, params):
+        from app.browser_context import (
+            browser_json_request,
+            AkoolBrowserAccountSuspended,
+            AkoolBrowserError,
+            AkoolBrowserTransportError,
+        )
+
+        if self._session_reader:
+            self.account = self._session_reader() or self.account
+        account = dict(self.account)
+        revision = int(account.get("session_revision") or 0)
+
+        def persist(context):
+            nonlocal revision
+            if self._session_writer:
+                updated = self._session_writer(context, revision)
+                if updated is None:
+                    raise ValueError(
+                        "account session changed during request verification"
+                    )
+                self.account = updated
+                revision = int(updated.get("session_revision") or revision)
+
+        if params:
+            url += ("&" if "?" in url else "?") + urlencode(params, doseq=True)
+        try:
+            value, context = browser_json_request(
+                account,
+                self.settings,
+                method,
+                url,
+                payload=payload,
+                headers={
+                    "Accept": "application/json",
+                    **(
+                        {"Content-Type": "application/json"}
+                        if payload is not None
+                        else {}
+                    ),
+                },
+                on_verified=persist,
+            )
+        except AkoolBrowserAccountSuspended as exc:
+            raise AkoolAccountSuspended() from exc
+        except AkoolBrowserTransportError:
+            raise
+        except (AkoolBrowserError, ValueError, KeyError) as exc:
+            raise AkoolAuthError(str(exc)) from exc
+        try:
+            persist(context)
+        except (ValueError, KeyError):
+            # Do not discard or replay an accepted paid POST if an administrator
+            # changed the account after its pre-dispatch identity check.
+            pass
+        self.cookie_header = str(context.get("cookie_header") or "")
+        self.user_agent = str(context.get("user_agent") or self.user_agent)
+        body = value.get("body")
+        return SimpleNamespace(
+            status_code=value["status"],
+            headers=value.get("headers") or {},
+            json=lambda: body,
+            text="",
+        )
 
     def _headers(self, *, json_body: bool = False, referer: str = "") -> dict[str, str]:
         headers = {
@@ -300,21 +376,31 @@ class AkoolClient:
         last_error: Exception | None = None
         for attempt in range(attempts):
             try:
-                response = self.session.request(
-                    method,
-                    url,
-                    headers=self._headers(json_body=payload is not None, referer=referer),
-                    json=payload,
-                    params=params,
-                    proxy=self.proxy_url or None,
-                    timeout=self.timeout,
-                    allow_redirects=True,
-                )
+                if self._session_reader:
+                    self.account = self._session_reader() or self.account
+                if self.account.get("session_mode") == "managed_profile":
+                    response = self._native_request(method, url, payload, params)
+                else:
+                    response = self.session.request(
+                        method,
+                        url,
+                        headers=self._headers(
+                            json_body=payload is not None, referer=referer
+                        ),
+                        json=payload,
+                        params=params,
+                        proxy=self.proxy_url or None,
+                        timeout=self.timeout,
+                        allow_redirects=True,
+                    )
                 content_type = str(response.headers.get("content-type") or "")
                 try:
                     body = response.json()
                 except Exception:
-                    body = {"message": response.text[:2000], "content_type": content_type}
+                    body = {
+                        "message": response.text[:2000],
+                        "content_type": content_type,
+                    }
                 message = _message(body, f"Akool HTTP {response.status_code}")
                 if _account_suspended_message(message):
                     raise AkoolAccountSuspended(message)
@@ -325,7 +411,8 @@ class AkoolClient:
                 ):
                     raise AkoolRateLimited(
                         message,
-                        retry_after=response.headers.get("Retry-After"),
+                        retry_after=response.headers.get("Retry-After")
+                        or response.headers.get("retry-after"),
                         details=body,
                     )
                 if response.status_code in {401, 419} or _auth_message(message):
@@ -400,9 +487,19 @@ class AkoolClient:
         data = verified.get("data") or {}
         user = data.get("user") or {}
         team = data.get("team") or {}
+        expected_email = str(self.account.get("email") or "").strip().casefold()
+        observed_email = str(user.get("email") or "").strip().casefold()
+        if expected_email and observed_email != expected_email:
+            raise AkoolAuthError(
+                "verified Akool session belongs to a different account"
+            )
+        if self.account.get("user_id") and str(user.get("_id") or "") != str(
+            self.account["user_id"]
+        ):
+            raise AkoolAuthError("verified Akool user id does not match this account")
         state, _ = self._request("GET", ACCOUNT_PATH, retry=True)
         state = self._require_ok(state, "account state")
-        quota = ((state.get("data") or {}).get("quota_info") or {})
+        quota = (state.get("data") or {}).get("quota_info") or {}
         try:
             credit = float(quota.get("credit") or 0)
         except (TypeError, ValueError):
@@ -426,7 +523,12 @@ class AkoolClient:
             "user_id": str(user.get("_id") or ""),
             "uid": user.get("uid"),
             "team_id": str(team.get("_id") or quota.get("team_id") or ""),
-            "email": str(user.get("email") or quota.get("email") or self.account.get("email") or ""),
+            "email": str(
+                user.get("email")
+                or quota.get("email")
+                or self.account.get("email")
+                or ""
+            ),
             "token": str(data.get("token") or ""),
             "buckets": {
                 "credit": credit,
@@ -499,7 +601,9 @@ class AkoolClient:
             raise AkoolUpstreamError("empty media source", code="MEDIA_DOWNLOAD_FAILED")
         if decoded := self._decode_data_url(source):
             data, content_type = decoded
-            filename = name or f"upload{mimetypes.guess_extension(content_type) or '.bin'}"
+            filename = (
+                name or f"upload{mimetypes.guess_extension(content_type) or '.bin'}"
+            )
             return data, content_type, filename
         if not source.startswith(("http://", "https://")):
             try:
@@ -533,8 +637,12 @@ class AkoolClient:
                         code="PROVIDER_INVALID_REQUEST",
                         status_code=422,
                     )
-                content_type = str(response.headers.get("content-type") or "").split(";", 1)[0]
-                filename = name or Path(urlparse(str(response.url)).path).name or "upload.bin"
+                content_type = str(response.headers.get("content-type") or "").split(
+                    ";", 1
+                )[0]
+                filename = (
+                    name or Path(urlparse(str(response.url)).path).name or "upload.bin"
+                )
                 return data, content_type or "application/octet-stream", filename
             except AkoolUpstreamError:
                 raise
@@ -624,7 +732,9 @@ class AkoolClient:
             "image/png",
             "image/webp",
         }
-        reencode = bool(force or operations or not known_extension or not known_content_type)
+        reencode = bool(
+            force or operations or not known_extension or not known_content_type
+        )
         output_width, output_height = image.size
         info = {
             "original_width": original_width,
@@ -954,19 +1064,25 @@ class AkoolClient:
             body = self._require_ok(body, "task list")
             data = body.get("data") or {}
             for item in data.get("result") or []:
-                if isinstance(item, dict) and str(item.get("_id") or "") == str(resource_id):
+                if isinstance(item, dict) and str(item.get("_id") or "") == str(
+                    resource_id
+                ):
                     status_value = int(item.get("video_status") or 0)
                     reason = failure_reason(item)
                     if status_value != 3 and is_rate_limit_message(reason):
                         raise AkoolRateLimited(reason, details=item)
                     status = {1: "PENDING", 2: "PROCESSING", 3: "COMPLETE"}.get(
                         status_value,
-                        "FAILED"
-                        if status_value >= 4
-                        or failure_reason(item) != "Akool generation failed"
-                        else "PROCESSING",
+                        (
+                            "FAILED"
+                            if status_value >= 4
+                            or failure_reason(item) != "Akool generation failed"
+                            else "PROCESSING"
+                        ),
                     )
-                    progress = float(item.get("progress") or (100 if status == "COMPLETE" else 0))
+                    progress = float(
+                        item.get("progress") or (100 if status == "COMPLETE" else 0)
+                    )
                     return {
                         "generationId": resource_id,
                         "providerTaskId": str(item.get("task_id") or ""),

@@ -10,12 +10,13 @@ from typing import Any
 
 from app.model_catalog import RESOLUTION_ALIASES, VIDEO_DIMENSIONS
 
-
 ACCOUNT_SECRET_FIELDS = {
     "password",
     "access_token",
     "cookie_header",
     "cookies_json",
+    "login_session_id",
+    "browser_binding_json",
 }
 
 _COST_RESOLUTION_LABELS = {
@@ -179,8 +180,7 @@ class Database:
 
     def initialize(self) -> None:
         with self._lock, self.connect() as connection:
-            connection.executescript(
-                """
+            connection.executescript("""
                 CREATE TABLE IF NOT EXISTS accounts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL UNIQUE,
@@ -280,8 +280,7 @@ class Database:
                     PRIMARY KEY(account_id, cache_key),
                     FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
                 );
-                """
-            )
+                """)
             account_columns = {
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(accounts)").fetchall()
@@ -294,6 +293,15 @@ class Database:
             for column, definition in (
                 ("tos_hash", "TEXT NOT NULL DEFAULT ''"),
                 ("tos_accepted_at", "TEXT NOT NULL DEFAULT ''"),
+                ("session_mode", "TEXT NOT NULL DEFAULT ''"),
+                ("session_revision", "INTEGER NOT NULL DEFAULT 0"),
+                ("session_updated_at", "INTEGER"),
+                ("session_source", "TEXT NOT NULL DEFAULT ''"),
+                ("online_draft", "INTEGER NOT NULL DEFAULT 0"),
+                ("browser_binding_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("login_session_id", "TEXT NOT NULL DEFAULT ''"),
+                ("login_lease_until", "INTEGER NOT NULL DEFAULT 0"),
+                ("maintenance_lease_until", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if column not in account_columns:
                     connection.execute(
@@ -314,23 +322,18 @@ class Database:
                     connection.execute(
                         f"ALTER TABLE tasks ADD COLUMN {column} {definition}"
                     )
-            connection.execute(
-                """
+            connection.execute("""
                 CREATE INDEX IF NOT EXISTS idx_ak_tasks_account_reservation
                 ON tasks(account_id)
                 WHERE reserved_cost > 0
-                """
-            )
-            connection.execute(
-                """
+                """)
+            connection.execute("""
                 CREATE INDEX IF NOT EXISTS idx_ak_tasks_account_slot
                 ON tasks(account_id)
                 WHERE account_slot_acquired = 1
-                """
-            )
+                """)
             self._ensure_model_cost_schema(connection)
-            connection.execute(
-                """
+            connection.execute("""
                 UPDATE tasks
                 SET account_slot_acquired = CASE
                     WHEN account_id IS NOT NULL
@@ -338,8 +341,7 @@ class Database:
                       AND (account_slot_acquired = 1 OR generation_id != '')
                     THEN 1 ELSE 0
                 END
-                """
-            )
+                """)
             connection.execute(
                 "UPDATE tasks SET reserved_cost = 0 WHERE account_slot_acquired = 0"
             )
@@ -473,6 +475,7 @@ class Database:
                     END,
                     last_checked_at = COALESCE(excluded.last_checked_at, accounts.last_checked_at),
                     last_login_at = COALESCE(excluded.last_login_at, accounts.last_login_at),
+                    session_revision = accounts.session_revision + 1,
                     updated_at = excluded.updated_at
                 """,
                 values,
@@ -551,8 +554,7 @@ class Database:
 
     def list_accounts(self, *, include_secrets: bool = False) -> list[dict[str, Any]]:
         with self.connect() as connection:
-            rows = connection.execute(
-                """
+            rows = connection.execute("""
                 SELECT
                     account.*,
                     COALESCE((
@@ -563,8 +565,7 @@ class Database:
                     ), 0) AS reserved_balance
                 FROM accounts AS account
                 ORDER BY account.id ASC
-                """
-            ).fetchall()
+                """).fetchall()
         return [
             self._account_view(dict(row), include_secrets=include_secrets)
             for row in rows
@@ -609,6 +610,8 @@ class Database:
             value[key] = bool(value.get(key))
         value["cookie_records"] = _json(value.get("cookies_json"), [])
         value["balance_details"] = _json(value.get("balance_details_json"), {})
+        if include_secrets:
+            value["browser_binding"] = _json(value.get("browser_binding_json"), {})
         max_concurrency = max(int(value.get("max_concurrency") or 1), 1)
         value["max_concurrency"] = max_concurrency
         reserved_balance = max(float(value.get("reserved_balance") or 0), 0)
@@ -631,6 +634,8 @@ class Database:
         if not include_secrets:
             for key in ACCOUNT_SECRET_FIELDS:
                 value[key] = "***" if value.get(key) else ""
+            value.pop("login_session_id", None)
+            value.pop("browser_binding_json", None)
             value["cookie_records"] = [
                 {
                     "name": item.get("name"),
@@ -689,15 +694,25 @@ class Database:
             "last_checked_at",
             "last_login_at",
             "last_used_at",
+            "session_mode",
+            "session_updated_at",
+            "session_source",
+            "online_draft",
+            "browser_binding_json",
+            "login_session_id",
+            "login_lease_until",
+            "maintenance_lease_until",
         }
         clean: dict[str, Any] = {}
         for raw_key, raw_value in changes.items():
             key = aliases.get(raw_key, raw_key)
             if key not in allowed:
                 continue
-            if key in {"cookies_json", "balance_details_json"} and not isinstance(
-                raw_value, str
-            ):
+            if key in {
+                "cookies_json",
+                "balance_details_json",
+                "browser_binding_json",
+            } and not isinstance(raw_value, str):
                 fallback = [] if key == "cookies_json" else {}
                 raw_value = json.dumps(raw_value or fallback, ensure_ascii=False)
             clean[key] = raw_value
@@ -711,12 +726,191 @@ class Database:
         clean["updated_at"] = now_ts()
         clean["id"] = int(account_id)
         assignments = ", ".join(f"{key} = :{key}" for key in clean if key != "id")
+        if set(clean) & {
+            "cookie_header",
+            "cookies_json",
+            "access_token",
+            "user_agent",
+            "sec_ch_ua",
+            "sec_ch_ua_platform",
+            "proxy_url",
+            "profile_dir",
+            "cdp_port",
+            "session_mode",
+            "email",
+            "user_id",
+            "browser_binding_json",
+        }:
+            assignments += ", session_revision = session_revision + 1"
         with self._lock, self.connect() as connection:
             connection.execute(
                 f"UPDATE accounts SET {assignments} WHERE id = :id",
                 clean,
             )
         return self.get_account(account_id)
+
+    def apply_browser_context(
+        self,
+        account_id: int,
+        context: dict[str, Any],
+        *,
+        expected_revision: int,
+        source: str = "browser",
+    ) -> dict[str, Any] | None:
+        """Commit a complete verified session, rejecting stale writers or identity drift."""
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM accounts WHERE id=?", (int(account_id),)
+            ).fetchone()
+            if row is None:
+                raise KeyError("account not found")
+            if int(row["session_revision"] or 0) != int(expected_revision):
+                return None
+            email = normalize_account_identity(context.get("email"))
+            user_id = str(context.get("user_id") or "")
+            if not email or not user_id:
+                raise ValueError("verified browser identity is incomplete")
+            if row["email"] and normalize_account_identity(row["email"]) != email:
+                raise ValueError("browser identity does not match this account")
+            if row["user_id"] and str(row["user_id"]) != user_id:
+                raise ValueError("browser user id does not match this account")
+            duplicate = connection.execute(
+                "SELECT id FROM accounts WHERE id!=? AND (LOWER(TRIM(email))=? OR (user_id!='' AND user_id=?)) LIMIT 1",
+                (int(account_id), email, user_id),
+            ).fetchone()
+            if duplicate:
+                raise ValueError(
+                    "this account already exists; open its existing login window"
+                )
+            values = {
+                key: context.get(key, "")
+                for key in (
+                    "cookie_header",
+                    "access_token",
+                    "user_agent",
+                    "sec_ch_ua",
+                    "sec_ch_ua_platform",
+                )
+            }
+            values.update(
+                email=str(context["email"]),
+                user_id=user_id,
+                cognito_sub=str(context.get("team_id") or ""),
+                cookies_json=json.dumps(
+                    context.get("cookie_records") or [], ensure_ascii=False
+                ),
+                browser_binding_json=json.dumps(
+                    context.get("browser_binding") or {},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                profile_dir=str(context.get("profile_dir") or row["profile_dir"]),
+                cdp_port=context.get("cdp_port") or row["cdp_port"],
+                session_mode="managed_profile",
+                session_updated_at=now_ts(),
+                session_source=source,
+                last_login_at=now_ts(),
+                updated_at=now_ts(),
+                id=int(account_id),
+            )
+            # An unchanged snapshot must not churn revisions and invalidate peer clients.
+            changes = {
+                key: value
+                for key, value in values.items()
+                if key
+                not in {
+                    "id",
+                    "updated_at",
+                    "session_updated_at",
+                    "last_login_at",
+                    "session_source",
+                }
+                and row[key] != value
+            }
+            if not changes:
+                observed = dict(row)
+                for field in (
+                    "session_updated_at",
+                    "session_source",
+                    "last_login_at",
+                    "updated_at",
+                ):
+                    observed[field] = values[field]
+                connection.execute(
+                    "UPDATE accounts SET session_updated_at=:session_updated_at, session_source=:session_source, last_login_at=:last_login_at, updated_at=:updated_at WHERE id=:id",
+                    values,
+                )
+                return self._account_view(observed, include_secrets=True)
+            assignments = ", ".join(f"{key}=:{key}" for key in values if key != "id")
+            connection.execute(
+                "UPDATE accounts SET "
+                + assignments
+                + ", session_revision=session_revision+1 WHERE id=:id",
+                values,
+            )
+        return self.get_account(account_id)
+
+    def claim_browser_login(
+        self, account_id: int, session_id: str, expires_at: int
+    ) -> dict[str, Any]:
+        with self._lock, self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM accounts WHERE id=?", (int(account_id),)
+            ).fetchone()
+            if row is None:
+                raise KeyError("account not found")
+            if int(row["active_tasks"] or 0):
+                raise ValueError("account has active tasks")
+            if int(row["maintenance_lease_until"] or 0) > now_ts():
+                raise ValueError("account maintenance is in progress")
+            unfinished = connection.execute(
+                "SELECT 1 FROM tasks WHERE account_id=? AND status NOT IN ('succeeded','failed','expired') LIMIT 1",
+                (int(account_id),),
+            ).fetchone()
+            if unfinished:
+                raise ValueError("account has unfinished tasks")
+            if (
+                row["login_session_id"]
+                and int(row["login_lease_until"] or 0) > now_ts()
+            ):
+                raise ValueError("account login is already in progress")
+            connection.execute(
+                "UPDATE accounts SET login_session_id=?,login_lease_until=?,status='browser_login',updated_at=? WHERE id=?",
+                (session_id, int(expires_at), now_ts(), int(account_id)),
+            )
+        return self._account_view(dict(row), include_secrets=True)
+
+    def release_browser_login(
+        self,
+        account_id: int,
+        session_id: str,
+        *,
+        enabled: bool,
+        status: str,
+        error: str = "",
+    ) -> bool:
+        with self._lock, self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE accounts SET login_session_id='',login_lease_until=0,enabled=?,status=?,last_error=?,updated_at=? WHERE id=? AND login_session_id=?",
+                (
+                    int(bool(enabled)),
+                    status,
+                    error,
+                    now_ts(),
+                    int(account_id),
+                    session_id,
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def clear_maintenance_leases(self) -> None:
+        """A new service process has no maintenance workers from its predecessor."""
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                "UPDATE accounts SET maintenance_lease_until=0 WHERE maintenance_lease_until!=0"
+            )
 
     def get_account_media_cache(
         self,
@@ -894,13 +1088,11 @@ class Database:
 
     def active_task_count(self) -> int:
         with self.connect() as connection:
-            row = connection.execute(
-                """
+            row = connection.execute("""
                 SELECT COUNT(*) AS count
                 FROM tasks
                 WHERE status NOT IN ('succeeded', 'failed', 'expired')
-                """
-            ).fetchone()
+                """).fetchone()
         return int(row["count"] or 0) if row else 0
 
     def acquire_account(
@@ -929,7 +1121,9 @@ class Database:
                     raise ValueError("task not found while reserving account balance")
                 if task["status"] in {"succeeded", "failed", "expired"}:
                     raise ValueError("cannot acquire an account for a finished task")
-                if task["account_slot_acquired"] or (recovering and task["generation_id"]):
+                if task["account_slot_acquired"] or (
+                    recovering and task["generation_id"]
+                ):
                     # A submitted task already occupies its original upstream account,
                     # even if the limit was lowered or the account was disabled later.
                     account_id = task["account_id"]
@@ -958,12 +1152,12 @@ class Database:
             parameters: list[Any] = []
             eligibility_clause = (
                 "candidate.enabled = 1 "
-                "AND candidate.status IN ('active', 'pending')"
+                "AND candidate.status IN ('active', 'pending') "
+                "AND candidate.login_lease_until <= strftime('%s','now')"
+                " AND candidate.maintenance_lease_until <= strftime('%s','now')"
             )
             if recovering and preferred_id is not None:
-                eligibility_clause = (
-                    f"(({eligibility_clause}) OR candidate.id = ?)"
-                )
+                eligibility_clause = f"(({eligibility_clause}) OR candidate.id = ?)"
                 parameters.append(int(preferred_id))
             preferred_clause = ""
             if preferred_id is not None:
@@ -1362,8 +1556,7 @@ class Database:
 
     def recoverable_tasks(self) -> list[dict[str, Any]]:
         with self.connect() as connection:
-            rows = connection.execute(
-                """
+            rows = connection.execute("""
                 SELECT id FROM tasks
                 WHERE status IN (
                     'queued', 'preparing', 'submitted', 'running'
@@ -1372,21 +1565,18 @@ class Database:
                     CASE WHEN generation_id != '' THEN 0
                          WHEN account_slot_acquired = 1 THEN 1 ELSE 2 END,
                     created_at ASC, rowid ASC
-                """
-            ).fetchall()
+                """).fetchall()
         return [
             task for row in rows if (task := self.get_task(str(row["id"]))) is not None
         ]
 
     def clear_finished_tasks(self) -> int:
         with self._lock, self.connect() as connection:
-            cursor = connection.execute(
-                """
+            cursor = connection.execute("""
                 DELETE FROM tasks
                 WHERE status IN ('succeeded', 'failed', 'expired')
                   AND account_slot_acquired = 0
-                """
-            )
+                """)
         return int(cursor.rowcount or 0)
 
     def record_model_cost(
@@ -1506,8 +1696,7 @@ class Database:
         )
 
     def _backfill_model_cost_records(self, connection: sqlite3.Connection) -> None:
-        rows = connection.execute(
-            """
+        rows = connection.execute("""
             SELECT id, request_json, upstream_response_json, actual_cost,
                    completed_at, updated_at
             FROM tasks
@@ -1519,8 +1708,7 @@ class Database:
                   WHERE model_cost_records.task_id = tasks.id
               )
             ORDER BY completed_at ASC, created_at ASC
-            """
-        ).fetchall()
+            """).fetchall()
         for row in rows:
             payload = _json(row["request_json"], {})
             if not isinstance(payload, dict):
@@ -1558,8 +1746,7 @@ class Database:
             ).fetchall()
             connection.execute("DROP INDEX IF EXISTS idx_hg_model_cost_lookup")
             connection.execute("DROP TABLE model_cost_records")
-            connection.execute(
-                """
+            connection.execute("""
                 CREATE TABLE model_cost_records (
                     task_id TEXT PRIMARY KEY,
                     model TEXT NOT NULL,
@@ -1568,8 +1755,7 @@ class Database:
                     cost REAL NOT NULL,
                     recorded_at INTEGER NOT NULL
                 )
-                """
-            )
+                """)
             legacy_columns = set(columns)
             for row in legacy_rows:
                 raw_resolution = (
@@ -1592,12 +1778,10 @@ class Database:
                         _cost_integer(row["recorded_at"], now_ts()),
                     ),
                 )
-        connection.execute(
-            """
+        connection.execute("""
             CREATE INDEX IF NOT EXISTS idx_hg_model_cost_lookup
             ON model_cost_records(model, duration, resolution, recorded_at)
-            """
-        )
+            """)
 
     @staticmethod
     def _normalize_model_cost_resolutions(connection: sqlite3.Connection) -> None:
@@ -1618,14 +1802,12 @@ class Database:
 
     def proxy_assignment_counts(self) -> dict[str, int]:
         with self.connect() as connection:
-            rows = connection.execute(
-                """
+            rows = connection.execute("""
                 SELECT proxy_url, COUNT(*) AS count
                 FROM accounts
                 WHERE TRIM(proxy_url) != ''
                 GROUP BY proxy_url
-                """
-            ).fetchall()
+                """).fetchall()
         return {str(row["proxy_url"]): int(row["count"] or 0) for row in rows}
 
     def get_setting(self, key: str, default: str = "") -> str:

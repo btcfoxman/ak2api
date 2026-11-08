@@ -8,6 +8,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates chromium ffmpeg xauth xvfb \
+        x11vnc fluxbox novnc fonts-liberation fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir -r requirements.txt
 
