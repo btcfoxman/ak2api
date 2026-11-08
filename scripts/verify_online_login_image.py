@@ -19,7 +19,9 @@ def verify(image):
     try:
         run(['docker','run','--rm','--network','none','--entrypoint','python',image,
             '-B','-c','import app.main; print("isolated_application_import_ok")'])
-        run(['docker','run','-d','--name',name,'--network','none','--shm-size','1g',
+        # Match compose init:true: xvfb-run must have an init parent instead of
+        # becoming PID 1 while waiting for the X server's readiness signal.
+        run(['docker','run','-d','--init','--name',name,'--network','none','--shm-size','1g',
             '--hostname','ak-offline-fixture','--add-host','ak-offline-fixture:127.0.0.1',
             '-e','AK_API_KEY='+token,'-e','AK_ADMIN_TOKEN='+token,
             '-e','AK_PROXY_POOL_ENABLED=false','-e','AK_PROXY_POOL=',
