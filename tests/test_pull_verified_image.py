@@ -212,7 +212,8 @@ def test_tool_all_checksum_failures_are_bounded_and_remove_partial(puller, monke
     assert calls == [None, "proxy"] and not (tmp_path / "crane.download").exists()
 
 
-def test_slow_pull_terminates_only_its_owned_process(puller, monkeypatch, tmp_path):
+@pytest.mark.parametrize("kilobytes_per_second", [0, 50])
+def test_slow_pull_terminates_only_its_owned_process(puller, monkeypatch, tmp_path, kilobytes_per_second):
     class Process:
         returncode = None
         stopped = False
@@ -227,6 +228,8 @@ def test_slow_pull_terminates_only_its_owned_process(puller, monkeypatch, tmp_pa
     ticks = iter([0, 46])
     monkeypatch.setattr(puller.time, "monotonic", lambda: next(ticks))
     monkeypatch.setattr(puller.time, "sleep", lambda *_: None)
+    if kilobytes_per_second:
+        (tmp_path / "image.tar").write_bytes(b"x" * (46 * kilobytes_per_second * 1024))
     with pytest.raises(RuntimeError, match="image_download_route_too_slow"):
         puller.pull(tmp_path / "crane", "ghcr.io/repo@sha256:fixed", tmp_path / "image.tar", None)
     assert process.stopped is True and len(calls) == 1
