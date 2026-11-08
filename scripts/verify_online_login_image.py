@@ -20,6 +20,7 @@ def verify(image):
         run(['docker','run','--rm','--network','none','--entrypoint','python',image,
             '-B','-c','import app.main; print("isolated_application_import_ok")'])
         run(['docker','run','-d','--name',name,'--network','none','--shm-size','1g',
+            '--hostname','ak-offline-fixture','--add-host','ak-offline-fixture:127.0.0.1',
             '-e','AK_API_KEY='+token,'-e','AK_ADMIN_TOKEN='+token,
             '-e','AK_PROXY_POOL_ENABLED=false','-e','AK_PROXY_POOL=',
             '-e','AK_DAILY_CHECKIN_ENABLED=false','-e','AK_ACCOUNT_MAINTENANCE_INTERVAL_SECONDS=86400',
@@ -36,7 +37,10 @@ def verify(image):
         if not ready:
             details=subprocess.run(['docker','logs','--tail','70',name],capture_output=True,text=True,timeout=15)
             state=subprocess.run(['docker','inspect','--format','{{json .State}}',name],capture_output=True,text=True,timeout=10)
+            process_probe="import json,pathlib; out=[]\nfor p in pathlib.Path('/proc').iterdir():\n if not p.name.isdigit():continue\n try:\n  a=(p/'cmdline').read_bytes().split(b'\\0'); out.append({'pid':p.name,'executable':a[0].decode(errors='replace'),'wchan':(p/'wchan').read_text().strip()})\n except (OSError,IndexError):pass\nprint(json.dumps(out))"
+            processes=subprocess.run(['docker','exec',name,'python','-B','-c',process_probe],capture_output=True,text=True,timeout=10)
             print(json.dumps({'fixture_container_state':state.stdout.strip(),
+                'fixture_processes':processes.stdout.strip(),
                 'fixture_startup_log':(details.stdout+details.stderr)[-12000:].replace(token,'[fixture-token]'),
                 'last_readiness_probe':last_probe.replace(token,'[fixture-token]')}),flush=True)
             raise AssertionError('isolated application did not become healthy; see fixture-only startup diagnostics')
