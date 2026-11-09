@@ -8,7 +8,7 @@ import pytest
 
 import app.browser_context as browser_context
 import app.browser_login as browser_login
-from app.akool_client import AkoolAuthError, AkoolClient, AkoolUpstreamError
+from app.akool_client import AkoolAuthError, AkoolClient, AkoolSessionConflict, AkoolUpstreamError
 from app.browser_context import (
     AkoolBrowserError,
     AkoolBrowserChallengeError,
@@ -92,6 +92,43 @@ def test_browser_context_rejects_identity_drift_before_persist(system, changed):
             expected_revision=0,
         )
     assert database.get_account(account["id"])["session_mode"] == ""
+
+
+@pytest.mark.parametrize("status", ["active", "network_error"])
+def test_session_conflict_does_not_change_account_login_status(system, monkeypatch, status):
+    database, service = system
+    account = database.upsert_account({"name": "one", "status": status, "auto_login": True})
+    client = AkoolClient(account, service.settings)
+
+    def conflict():
+        raise AkoolSessionConflict()
+
+    monkeypatch.setattr(client, "account_state", conflict)
+    monkeypatch.setattr(service, "_client", lambda _: client)
+    before = database.get_account(account["id"])
+    with pytest.raises(AkoolSessionConflict):
+        service.check_account(account["id"], recover=False)
+    after = database.get_account(account["id"])
+    for key in ("status", "enabled", "last_error", "last_checked_at"):
+        assert after[key] == before[key]
+
+
+def test_maintenance_session_conflict_never_schedules_login(system, monkeypatch):
+    database, service = system
+    account = database.upsert_account({"name": "one", "enabled": True,
+                                       "status": "network_error", "auto_login": True})
+    logins = []
+
+    def conflict(*args, **kwargs):
+        raise AkoolSessionConflict()
+
+    monkeypatch.setattr(service, "check_account", conflict)
+    monkeypatch.setattr(service, "schedule_login", lambda account_id: logins.append(account_id))
+    service._maintenance_check(account["id"])
+    assert logins == []
+    after = database.get_account(account["id"])
+    assert after["status"] == "network_error"
+    assert after["maintenance_lease_until"] == 0
 
 
 def test_browser_context_cannot_adopt_an_existing_disabled_identity(system):
@@ -319,8 +356,9 @@ def test_native_paid_post_stale_capture_aborts_before_business_call(
         pytest.fail("stale pre-dispatch session must abort here")
 
     monkeypatch.setattr(browser_context, "browser_json_request", native)
-    with pytest.raises(AkoolAuthError, match="changed during request"):
+    with pytest.raises(AkoolSessionConflict) as failure:
         client._request("POST", "/api/create")
+    assert failure.value.code == "ACCOUNT_SESSION_CHANGED"
 
 
 def test_native_paid_post_is_not_retried_on_transport_failure(system, monkeypatch):
@@ -404,7 +442,7 @@ def test_service_does_not_recover_or_replay_paid_post_after_verified_dispatch(
 
 
 @pytest.mark.parametrize("preflight_failure", ["login", "stale-cas"])
-def test_service_can_recover_before_verified_dispatch(
+def test_service_recovers_only_auth_failures_before_verified_dispatch(
     system, monkeypatch, preflight_failure
 ):
     _, service = system
@@ -432,6 +470,13 @@ def test_service_can_recover_before_verified_dispatch(
 
     monkeypatch.setattr(browser_context, "browser_json_request", native)
     monkeypatch.setattr(service, "_recover_client", recover)
+    if preflight_failure == "stale-cas":
+        with pytest.raises(AkoolSessionConflict):
+            service._with_recovery(
+                account, first, lambda item: item.generate({"prompt": "fixture"})
+            )
+        assert len(attempts) == 1 and submitted == [] and recoveries == []
+        return
     result, active = service._with_recovery(
         account, first, lambda item: item.generate({"prompt": "fixture"})
     )

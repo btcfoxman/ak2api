@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import app.service as service_module
 import pytest
-from app.akool_client import AkoolAccountSuspended, AkoolRateLimited, AkoolUpstreamError, MediaUpload
+from app.akool_client import AkoolAccountSuspended, AkoolRateLimited, AkoolSessionConflict, AkoolUpstreamError, MediaUpload
 from app.db import Database
 from app.service import AKService, PUBLIC_MODERATION_FAILURE, _DynamicSlots
 
@@ -442,6 +442,7 @@ def test_task_uses_dynamic_fee_and_refreshes_balance(tmp_path, monkeypatch) -> N
         (AkoolUpstreamError("temporarily unavailable", code="RATE_LIMITED", status_code=429), [2, 4, 8]),
         (AkoolUpstreamError("connection reset", code="NETWORK_ERROR"), [2, 4, 8]),
         (AkoolUpstreamError("service unavailable", code="AKOOL_HTTP_ERROR"), [2, 4, 8]),
+        (AkoolSessionConflict(), [2, 4, 8]),
     ],
 )
 def test_transient_poll_errors_keep_account_slot_until_original_task_completes(

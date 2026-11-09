@@ -32,6 +32,7 @@ from app.akool_client import (
     AkoolAuthError,
     AkoolClient,
     AkoolRiskBlocked,
+    AkoolSessionConflict,
     AkoolUpstreamError,
     MediaUpload,
     failure_reason,
@@ -982,6 +983,9 @@ class AKService:
             return (
                 self.db.get_account(account_id, include_secrets=False) or updated or {}
             )
+        except AkoolSessionConflict:
+            # A local pre-dispatch revision conflict does not invalidate login.
+            raise
         except Exception as exc:
             if isinstance(exc, (AkoolAccountSuspended, AkoolBrowserAccountSuspended)):
                 self._mark_account_suspended(account_id)
@@ -1586,7 +1590,7 @@ class AKService:
                     if not (
                         exc.status_code == 429
                         or exc.code
-                        in {"RATE_LIMITED", "NETWORK_ERROR", "AKOOL_HTTP_ERROR"}
+                        in {"RATE_LIMITED", "NETWORK_ERROR", "AKOOL_HTTP_ERROR", "ACCOUNT_SESSION_CHANGED"}
                         or is_rate_limit_message(exc)
                     ):
                         raise
@@ -2106,6 +2110,8 @@ class AKService:
                 )
         except Exception as exc:
             LOGGER.info("account %s maintenance check failed: %s", account_id, exc)
+            if isinstance(exc, AkoolSessionConflict):
+                return
             if isinstance(
                 exc,
                 (AkoolAccountSuspended, AkoolBrowserAccountSuspended),

@@ -65,6 +65,14 @@ class AkoolAuthError(AkoolUpstreamError):
         super().__init__(message, code="AKOOL_AUTH_REQUIRED", status_code=401)
 
 
+class AkoolSessionConflict(AkoolUpstreamError):
+    def __init__(self):
+        super().__init__(
+            "account session changed before request dispatch; retry with the current session",
+            code="ACCOUNT_SESSION_CHANGED", status_code=503,
+        )
+
+
 class AkoolRateLimited(AkoolUpstreamError):
     def __init__(
         self,
@@ -251,6 +259,15 @@ class AkoolClient:
         self._session_reader, self._session_writer = reader, writer
 
     def _native_request(self, method, url, payload, params):
+        from app.browser_context import _account_lock
+
+        # Browser requests already share this reentrant per-account lock. Keep
+        # the latest DB read and both verified observations within that same
+        # boundary so queued peers never write a pre-wait session revision.
+        with _account_lock(int(self.account["id"])):
+            return self._native_request_locked(method, url, payload, params)
+
+    def _native_request_locked(self, method, url, payload, params):
         from app.browser_context import (
             browser_json_request,
             AkoolBrowserAccountSuspended,
@@ -270,9 +287,7 @@ class AkoolClient:
             if self._session_writer:
                 updated = self._session_writer(context, revision)
                 if updated is None:
-                    raise ValueError(
-                        "account session changed during request verification"
-                    )
+                    raise AkoolSessionConflict()
                 self.account = updated
                 revision = int(updated.get("session_revision") or revision)
             preflight_complete = True
@@ -311,7 +326,7 @@ class AkoolClient:
             raise AkoolAuthError(str(exc)) from exc
         try:
             persist(context)
-        except (ValueError, KeyError):
+        except (ValueError, KeyError, AkoolSessionConflict):
             # Do not discard or replay an accepted paid POST if an administrator
             # changed the account after its pre-dispatch identity check.
             pass
