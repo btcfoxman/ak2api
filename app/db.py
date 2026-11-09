@@ -808,6 +808,8 @@ class Database:
                 profile_dir=str(context.get("profile_dir") or row["profile_dir"]),
                 cdp_port=context.get("cdp_port") or row["cdp_port"],
                 session_mode="managed_profile",
+                tos_hash=str(context.get("tos_hash") or row["tos_hash"]),
+                tos_accepted_at=str(context.get("tos_accepted_at") or row["tos_accepted_at"]),
                 session_updated_at=now_ts(),
                 session_source=source,
                 last_login_at=now_ts(),

@@ -162,6 +162,8 @@ class NativeClient:
             return "https://akool.com/zh-cn/"
         if expression == "navigator.userAgent":
             return "real-browser-agent"
+        if "__akGenerationConsentPreconfirm" in expression:
+            return {"ok": True, "origin": "https://akool.com", "key": "akool-generation-consent", "value": "true", "written": False}
         if "brands:navigator.userAgentData" in expression:
             return {
                 "brands": [{"brand": "Chromium", "version": "151"}],
@@ -536,6 +538,116 @@ def test_online_draft_is_disabled_until_identity_and_balance_are_verified(manage
         assert manager.desktops[draft["id"]] is desktop and desktop.starts == 2
         await manager.cancel(second["active"]["session_id"])
         await manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_finish_revokes_interactive_control_before_releasing_account_lease(manager):
+    async def scenario():
+        account = manager.store.upsert_account(
+            {"name": "finish-ready", "enabled": True, "status": "active"}
+        )
+        info = await manager.start(account["id"])
+        sid = info["active"]["session_id"]
+        lease = manager.active
+        ticket = lease["ticket"]
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = lease["desktop"].revoke_viewer
+
+        async def delayed_revoke():
+            entered.set()
+            await release.wait()
+            await original()
+
+        lease["desktop"].revoke_viewer = delayed_revoke
+        finishing = asyncio.create_task(manager.finish(sid))
+        try:
+            await entered.wait()
+            assert manager.viewer(ticket) is None
+            assert manager.store.get_account(account["id"])["login_lease_until"] > int(time.time())
+            assert manager.store.acquire_account(account["id"]) is None
+            assert account["id"] in manager.service._online_browser_accounts
+            assert manager.service.status()["interactive_browser_count"] == 1
+        finally:
+            release.set()
+            await finishing
+            manager.store.release_account(account["id"])
+            await manager.close()
+        assert manager.store.get_account(account["id"])["login_lease_until"] == 0
+        assert manager.active is None
+
+    asyncio.run(scenario())
+
+
+def test_finish_viewer_revoke_failure_retains_lease_and_verified_session(manager):
+    async def scenario():
+        draft = manager.create_pending({"name": "finish-retry", "use_proxy_pool": False})
+        started = await manager.start(draft["id"])
+        sid = started["active"]["session_id"]
+        lease = manager.active
+        original = lease["desktop"].revoke_viewer
+
+        async def failed_revoke():
+            raise RuntimeError("synthetic viewer shutdown failed")
+
+        lease["desktop"].revoke_viewer = failed_revoke
+        try:
+            with pytest.raises(LoginError, match="viewer.*close") as failure:
+                await manager.finish(sid)
+            assert failure.value.status == 503
+            current = manager.store.get_account(draft["id"])
+            assert current["login_lease_until"] > int(time.time())
+            assert current["online_draft"] == 1 and not current["enabled"]
+            assert current["status"] != "login_required" and current["last_error"] == ""
+            assert lease["last_identity_ok"] and lease["phase"] == "login"
+            assert draft["id"] in manager.service._online_browser_accounts
+            assert manager.store.acquire_account(draft["id"]) is None
+            lease["desktop"].revoke_viewer = original
+            saved = await manager.finish(sid)
+            assert saved["enabled"] and saved["online_draft"] == 0
+            assert manager.active is None
+        finally:
+            lease["desktop"].revoke_viewer = original
+            await manager.close()
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_finish_keeps_account_leased_until_viewer_can_close(manager):
+    async def scenario():
+        account = manager.store.upsert_account(
+            {"name": "finish-cancelled", "enabled": True, "status": "active"}
+        )
+        started = await manager.start(account["id"])
+        sid = started["active"]["session_id"]
+        lease = manager.active
+        original = lease["desktop"].revoke_viewer
+        entered = asyncio.Event()
+
+        async def interrupted_revoke():
+            entered.set()
+            await asyncio.Event().wait()
+
+        lease["desktop"].revoke_viewer = interrupted_revoke
+        finishing = asyncio.create_task(manager.finish(sid))
+        try:
+            await entered.wait()
+            finishing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await finishing
+            current = manager.store.get_account(account["id"])
+            assert current["login_lease_until"] > int(time.time())
+            assert current["last_error"] == "" and lease["last_identity_ok"]
+            assert lease["phase"] == "login"
+            assert account["id"] in manager.service._online_browser_accounts
+            assert manager.store.acquire_account(account["id"]) is None
+            lease["desktop"].revoke_viewer = original
+            await manager.finish(sid)
+            assert manager.active is None
+            assert manager.store.get_account(account["id"])["login_lease_until"] == 0
+        finally:
+            lease["desktop"].revoke_viewer = original
+            await manager.close()
 
     asyncio.run(scenario())
 

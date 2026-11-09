@@ -20,6 +20,12 @@ from app.cookies import cookie_header_from_records, cookie_records
 
 AKOOL_LOGIN_PAGE = "https://akool.com/zh-cn/pricing"
 AKOOL_VERIFY_PATH = "/interface/user-api/api/v6/verify/user"
+GENERATION_CONSENT_ORIGIN = "https://akool.com"
+GENERATION_CONSENT_KEY = "akool-generation-consent"
+GENERATION_CONSENT_HASH = "local-storage:sha256:" + hashlib.sha256(
+    b"https://akool.com\nlocalStorage\nakool-generation-consent=true\nfrontend-generation-guard-v1"
+).hexdigest()
+GENERATION_RESULT_PATH = "/interface/content-api/api/v6/content/resourceResult/list"
 
 # The site handles login in JavaScript. Never allow its fallback GET form to
 # put credentials in navigation URLs before React has attached its handler.
@@ -42,6 +48,14 @@ class AkoolBrowserError(RuntimeError):
 
 class AkoolBrowserChallengeError(AkoolBrowserError):
     pass
+
+
+class AkoolBrowserConsentError(AkoolBrowserError):
+    code = "AGREEMENT_REQUIRED"
+    status_code = 503
+
+    def __init__(self):
+        super().__init__("Akool generation agreement preparation is required; reopen the account login")
 
 
 class AkoolBrowserTransportError(AkoolBrowserError):
@@ -547,8 +561,43 @@ def _browser_verify(client: _CDP) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def ensure_generation_consent(client: _CDP) -> dict[str, Any]:
+    """Prepare only the observed local marker, without resuming a UI action.
+
+    The caller verifies account identity first. This is a local mechanism
+    receipt, never a server-provided agreement/version hash.
+    """
+    expression = r"""(() => {
+      const __akGenerationConsentPreconfirm = true;
+      const expectedOrigin = __ORIGIN__;
+      const key = __KEY__;
+      if (location.origin !== expectedOrigin) return {ok:false, reason:'origin_mismatch'};
+      try {
+        const existing = window.localStorage.getItem(key);
+        if (existing === 'true') return {ok:true, origin:location.origin, key, value:'true', written:false};
+        window.localStorage.setItem(key, 'true');
+        const value = window.localStorage.getItem(key);
+        return {ok:value === 'true', origin:location.origin, key, value, written:true};
+      } catch (_) {return {ok:false, reason:'storage_unavailable'};}
+    })()""".replace("__ORIGIN__", json.dumps(GENERATION_CONSENT_ORIGIN)).replace("__KEY__", json.dumps(GENERATION_CONSENT_KEY))
+    try:
+        result = client.evaluate(expression)
+    except Exception:
+        raise AkoolBrowserConsentError() from None
+    if (not isinstance(result, dict) or result.get("ok") is not True
+            or result.get("origin") != GENERATION_CONSENT_ORIGIN
+            or result.get("key") != GENERATION_CONSENT_KEY or result.get("value") != "true"):
+        raise AkoolBrowserConsentError()
+    return {
+        "mechanism": "browser_local_storage", "origin": GENERATION_CONSENT_ORIGIN,
+        "key": GENERATION_CONSENT_KEY, "value": "true", "written": result.get("written") is True,
+        "server_acknowledgement": False, "mechanism_hash": GENERATION_CONSENT_HASH,
+    }
+
+
 def _verified_context(
-    client: _CDP, account: dict[str, Any], settings: Any, body: dict[str, Any]
+    client: _CDP, account: dict[str, Any], settings: Any, body: dict[str, Any], *,
+    initialize_consent: bool = True,
 ) -> dict[str, Any]:
     data = body.get("data") or {}
     user = data.get("user") or {}
@@ -558,8 +607,20 @@ def _verified_context(
         account.get("email") and email.casefold() != str(account["email"]).casefold()
     ):
         raise AkoolBrowserError("Browser session belongs to a different account")
-    if account.get("user_id") and str(user.get("_id") or "") != str(account["user_id"]):
+    user_id = str(user.get("_id") or "")
+    if not user_id:
+        raise AkoolBrowserError("Browser session identity is incomplete")
+    if account.get("user_id") and user_id != str(account["user_id"]):
         raise AkoolBrowserError("Browser session user id does not match this account")
+    consent_fields = {}
+    if initialize_consent:
+        receipt = ensure_generation_consent(client)
+        accepted_at = (str(account.get("tos_accepted_at") or "")
+                       if account.get("tos_hash") == GENERATION_CONSENT_HASH else "")
+        accepted_at = accepted_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        receipt["local_accepted_or_first_observed_at"] = accepted_at
+        consent_fields = {"tos_hash": GENERATION_CONSENT_HASH, "tos_accepted_at": accepted_at,
+                          "generation_consent_receipt": receipt}
     latest = [
         item
         for item in client.call("Network.getAllCookies").get("cookies", [])
@@ -579,11 +640,12 @@ def _verified_context(
         if isinstance(item, dict)
     )
     return {
+        **consent_fields,
         "cookie_header": cookie_header_from_records(latest),
         "cookie_records": latest,
         "cookies_json": latest,
         "access_token": str(data.get("token") or ""),
-        "user_id": str(user.get("_id") or ""),
+        "user_id": user_id,
         "team_id": str(team.get("_id") or ""),
         "email": email,
         "user_agent": str(client.evaluate("navigator.userAgent") or ""),
@@ -701,6 +763,8 @@ def refresh_account_context(account: dict[str, Any], settings: Any) -> dict[str,
                         raise AkoolBrowserAccountSuspended(
                             "Akool account has been suspended"
                         )
+                except AkoolBrowserConsentError:
+                    raise
                 except AkoolBrowserTransportError:
                     raise
                 except AkoolBrowserAccountSuspended:
@@ -850,7 +914,9 @@ def browser_json_request(
                 raise AkoolBrowserChallengeError(
                     "browser session requires login or verification"
                 )
-            context = _verified_context(client, account, settings, identity)
+            result_read = method.upper() == "GET" and parsed.path == GENERATION_RESULT_PATH
+            context = _verified_context(client, account, settings, identity,
+                                        initialize_consent=not result_read)
             if on_verified:
                 on_verified(context)
             safe_headers = {
@@ -888,7 +954,8 @@ def browser_json_request(
             try:
                 after = _browser_verify(client).get("body") or {}
                 if after.get("code") == 1000:
-                    context = _verified_context(client, account, settings, after)
+                    context = _verified_context(client, account, settings, after,
+                                                initialize_consent=False)
             except AkoolBrowserError:
                 pass
             return value, context

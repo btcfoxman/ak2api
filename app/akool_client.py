@@ -20,6 +20,12 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from app.config import normalize_proxy_url, rewrite_loopback_proxy
 from app.cookies import cookie_header_from_records, cookie_records
 from app.model_catalog import model_spec
+from app.generation_lookup import GenerationLookupCache, begin_lookup
+from app.error_classification import (
+    is_auth_message as _classify_auth, is_risk_message as _classify_risk,
+    is_suspended_message as _classify_suspended, is_rate_limit_message as _classify_rate,
+    is_moderation_failure, is_media_constraint_failure, is_media_download_failure,
+)
 
 AKOOL_ORIGIN = "https://akool.com"
 VERIFY_PATH = "/interface/user-api/api/v6/verify/user"
@@ -129,46 +135,19 @@ def _message(payload: Any, fallback: str) -> str:
 
 
 def _risk_message(value: str) -> bool:
-    text = value.lower()
-    return any(
-        marker in text
-        for marker in (
-            "turnstile",
-            "cloudflare",
-            "verify you are human",
-            "captcha",
-            "challenge-platform",
-            "access denied",
-        )
-    )
+    return _classify_risk(value)
 
 
 def _auth_message(value: str) -> bool:
-    text = value.lower()
-    return any(
-        marker in text
-        for marker in (
-            "unauthorized",
-            "not logged in",
-            "login required",
-            "invalid token",
-            "token expired",
-            "session expired",
-        )
-    )
+    return _classify_auth(value)
 
 
 def _account_suspended_message(value: str) -> bool:
-    text = value.lower()
-    return "account has been suspended" in text or "account is suspended" in text
+    return _classify_suspended(value)
 
 
 def is_rate_limit_message(value: Any) -> bool:
-    text = str(value or "").lower()
-    return any(
-        marker in text
-        for marker in ("too many requests", "rate limit", "rate_limit", "ratelimit")
-    )
+    return _classify_rate(value)
 
 
 def rate_limit_retry_after(message: str, header: Any = None) -> float | None:
@@ -266,6 +245,7 @@ class AkoolClient:
         self.session = curl_requests.Session(impersonate="chrome")
         self._session_reader = None
         self._session_writer = None
+        self._lookup_private_cache = GenerationLookupCache()
 
     def set_session_callbacks(self, reader, writer) -> None:
         self._session_reader, self._session_writer = reader, writer
@@ -274,6 +254,7 @@ class AkoolClient:
         from app.browser_context import (
             browser_json_request,
             AkoolBrowserAccountSuspended,
+            AkoolBrowserConsentError,
             AkoolBrowserError,
             AkoolBrowserTransportError,
         )
@@ -317,6 +298,8 @@ class AkoolClient:
             )
         except AkoolBrowserAccountSuspended as exc:
             raise AkoolAccountSuspended() from exc
+        except AkoolBrowserConsentError as exc:
+            raise AkoolUpstreamError(str(exc), code="AGREEMENT_REQUIRED", status_code=503) from exc
         except AkoolBrowserTransportError:
             raise
         except (AkoolBrowserError, ValueError, KeyError) as exc:
@@ -409,6 +392,17 @@ class AkoolClient:
                         "content_type": content_type,
                     }
                 message = _message(body, f"Akool HTTP {response.status_code}")
+                # A policy/material rejection is definitive, including HTTP403.
+                # It must not be mistaken for an expired browser session and replayed.
+                if is_moderation_failure(message):
+                    raise AkoolUpstreamError(message, code="CONTENT_MODERATION_FAILED",
+                                             status_code=422, details=body)
+                if is_media_constraint_failure(message):
+                    raise AkoolUpstreamError(message, code="PROVIDER_INVALID_REQUEST",
+                                             status_code=422, details=body)
+                if is_media_download_failure(message):
+                    raise AkoolUpstreamError(message, code="MEDIA_DOWNLOAD_FAILED",
+                                             status_code=422, details=body)
                 if _account_suspended_message(message):
                     raise AkoolAccountSuspended(message)
                 if (
@@ -470,6 +464,15 @@ class AkoolClient:
             raise AkoolAccountSuspended(message)
         if code in (429, "429") or is_rate_limit_message(message):
             raise AkoolRateLimited(message, details=body)
+        if is_moderation_failure(message):
+            raise AkoolUpstreamError(message, code="CONTENT_MODERATION_FAILED",
+                                     status_code=422, details=body)
+        if is_media_constraint_failure(message):
+            raise AkoolUpstreamError(message, code="PROVIDER_INVALID_REQUEST",
+                                     status_code=422, details=body)
+        if is_media_download_failure(message):
+            raise AkoolUpstreamError(message, code="MEDIA_DOWNLOAD_FAILED",
+                                     status_code=422, details=body)
         if _risk_message(message):
             raise AkoolRiskBlocked(message)
         if _auth_message(message):
@@ -810,6 +813,32 @@ class AkoolClient:
         if kind not in {"image", "video", "audio"}:
             raise ValueError(f"unsupported media kind: {kind}")
         data, content_type, filename = self._download_source(source, name)
+        detected_audio_type = ""
+        if kind == "audio":
+            # Storage may return an octet-stream MIME or a misleading suffix.
+            # Use the actual audio container before validating a model's inputs.
+            if data.startswith(b"RIFF") and data[8:12] == b"WAVE":
+                content_type = "audio/wav"
+            elif data.startswith(b"ID3") or (
+                len(data) >= 2 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0
+                and (data[1] >> 1) & 3 == 1
+            ):
+                content_type = "audio/mpeg"
+            elif data.startswith(b"fLaC"):
+                content_type = "audio/flac"
+            elif data.startswith(b"OggS"):
+                content_type = "audio/ogg"
+            elif len(data) >= 8 and data[4:8] == b"ftyp":
+                content_type = "audio/mp4"
+            else:
+                content_type = content_type.split(";", 1)[0].strip().lower()
+            # Keep the signature extension and profile filename consistent with
+            # recognized bytes, rather than signing a WAV container as MP3.
+            suffix = {"audio/wav": ".wav", "audio/mpeg": ".mp3", "audio/flac": ".flac",
+                      "audio/ogg": ".ogg", "audio/mp4": ".m4a"}.get(content_type)
+            if suffix:
+                detected_audio_type = content_type
+                filename = (Path(filename).stem or "reference") + suffix
         image_info: dict[str, Any] = {}
         if kind == "image":
             data, content_type, filename, image_info = self._prepare_image(
@@ -847,6 +876,15 @@ class AkoolClient:
         if not upload_url or not public_url:
             raise AkoolUpstreamError("upload signature response is incomplete")
         signed_content_type = str(signed.get("content_type") or content_type)
+        if detected_audio_type:
+            signed_type = signed_content_type.split(";", 1)[0].strip().lower()
+            signed_type = {"audio/x-wav": "audio/wav", "audio/wave": "audio/wav",
+                           "audio/mp3": "audio/mpeg", "audio/x-mpeg": "audio/mpeg",
+                           "audio/x-flac": "audio/flac", "audio/x-m4a": "audio/mp4",
+                           "application/ogg": "audio/ogg", "audio/x-ogg": "audio/ogg"}.get(signed_type, signed_type)
+            if signed_type not in {detected_audio_type, "application/octet-stream"}:
+                raise AkoolUpstreamError("Upload signature content type conflicts with the audio container",
+                                         code="AKOOL_HTTP_ERROR", status_code=502)
         self._put_signed(upload_url, data, signed_content_type)
         profile_input = {
             "url": public_url,
@@ -871,7 +909,7 @@ class AkoolClient:
             url=str(item.get("url") or public_url),
             kind=kind,
             name=filename,
-            content_type=signed_content_type,
+            content_type=content_type if kind == "audio" else signed_content_type,
             size=len(data),
             duration_ms=int(item.get("duration") or 0),
             width=int(item.get("file_width") or image_info.get("width") or 0),
@@ -922,9 +960,44 @@ class AkoolClient:
         images = [item for item in uploads if item.kind == "image"]
         videos = [item for item in uploads if item.kind == "video"]
         audio = [item for item in uploads if item.kind == "audio"]
+        if len(images) > spec.max_images or len(videos) > spec.max_videos or len(audio) > spec.max_audio:
+            raise AkoolUpstreamError("Reference input count is unsupported by the selected model",
+                                     code="PROVIDER_INVALID_REQUEST", status_code=422)
+        if spec.max_reference_inputs and len(uploads) > spec.max_reference_inputs:
+            raise AkoolUpstreamError("Total reference input count exceeds the model limit",
+                                     code="PROVIDER_INVALID_REQUEST", status_code=422)
+        size_limits = {"image": spec.max_image_bytes, "video": spec.max_video_bytes,
+                       "audio": spec.max_audio_bytes}
+        for item in uploads:
+            limit = size_limits.get(item.kind, 0)
+            if limit and item.size > limit:
+                raise AkoolUpstreamError(f"Reference {item.kind} file size exceeds the selected model limit",
+                                         code="PROVIDER_INVALID_REQUEST", status_code=422)
+        if spec.audio_duration_per_item:
+            for item in audio:
+                seconds = item.duration_ms / 1000
+                if not math.isfinite(seconds) or not spec.min_audio_seconds <= seconds <= spec.max_audio_seconds:
+                    raise AkoolUpstreamError(
+                        f"Audio reference duration must be between {spec.min_audio_seconds}s and {spec.max_audio_seconds}s",
+                        code="PROVIDER_INVALID_REQUEST", status_code=422)
+                if spec.audio_content_types:
+                    media_type = item.content_type.split(';', 1)[0].strip().lower()
+                    media_type = {"audio/mp3": "audio/mpeg", "audio/x-mpeg": "audio/mpeg"}.get(media_type, media_type)
+                    if media_type in {"application/octet-stream", ""}:
+                        media_type = mimetypes.guess_type(item.name)[0] or media_type
+                    if media_type not in spec.audio_content_types:
+                        raise AkoolUpstreamError("Audio reference format is unsupported by the selected model",
+                                                 code="PROVIDER_INVALID_REQUEST", status_code=422)
+        if spec.min_video_seconds:
+            for item in videos:
+                seconds = item.duration_ms / 1000
+                if not math.isfinite(seconds) or seconds < spec.min_video_seconds:
+                    raise AkoolUpstreamError(
+                        f"Video reference duration must be between {spec.min_video_seconds}s and {spec.max_video_seconds}s",
+                        code="PROVIDER_INVALID_REQUEST", status_code=422)
         audio_seconds = sum(item.duration_ms for item in audio) / 1000
         video_seconds = sum(item.duration_ms for item in videos) / 1000
-        if spec.max_audio_seconds and audio_seconds > spec.max_audio_seconds:
+        if not spec.audio_duration_per_item and spec.max_audio_seconds and audio_seconds > spec.max_audio_seconds:
             raise AkoolUpstreamError(
                 f"Total audio duration cannot exceed {spec.max_audio_seconds} seconds",
                 code="PROVIDER_INVALID_REQUEST",
@@ -948,9 +1021,9 @@ class AkoolClient:
         request = {
             "prompt": prompt,
             "negativePrompt": str(payload.get("negative_prompt") or ""),
-            "extendPrompt": bool(payload.get("extend_prompt", True)),
+            "extendPrompt": bool(payload.get("extend_prompt", True)) if spec.supports_extend_prompt else False,
             "count": 1,
-            "resolution": str(payload.get("resolution") or spec.resolutions[0]),
+            "resolution": str(payload.get("resolution") or spec.default_resolution or spec.resolutions[0]),
             "modifiers": payload.get("modifiers")
             or [
                 {
@@ -959,16 +1032,19 @@ class AkoolClient:
                     "config": {"speeds": [-1, -1, -1, -1, -1]},
                 }
             ],
-            "video_length": int(payload.get("duration") or spec.durations[0]),
+            "video_length": int(payload.get("duration") or spec.default_duration or spec.durations[0]),
             "imageUrl": [item.url for item in images],
             "model_name": upstream_model,
         }
+        if spec.model_mode:
+            request["model_mode"] = spec.model_mode
         if prompt_info:
             request["prompt_info"] = prompt_info
         if audio:
-            request["audio_type"] = spec.audio_type
+            if spec.include_audio_type:
+                request["audio_type"] = spec.audio_type
             request["reference_audio_urls"] = [item.url for item in audio]
-        ratio = str(payload.get("aspect_ratio") or "adaptive")
+        ratio = str(payload.get("aspect_ratio") or spec.default_aspect_ratio or "adaptive")
         if ratio != "adaptive":
             request["ratio"] = ratio
         if videos:
@@ -1003,9 +1079,9 @@ class AkoolClient:
             "resolution": upstream_request["resolution"],
             "options": {
                 "duration": int(upstream_request["video_length"]),
-                "generate_audio": bool(
+                "generate_audio": (spec.fee_generate_audio if spec.fee_generate_audio is not None else bool(
                     upstream_request.get("generate_audio", spec.generate_audio)
-                ),
+                )),
                 "hasVideo": bool(videos),
                 "is_canvas_workflow": False,
                 "is_unlimited_model": False,
@@ -1025,9 +1101,14 @@ class AkoolClient:
         body = self._require_ok(body, "calculate fee")
         data = body.get("data") or {}
         try:
-            fee = float(data.get("fee") or 0)
+            if not isinstance(data, dict) or "fee" not in data or isinstance(data["fee"], bool):
+                raise ValueError
+            fee = float(data["fee"])
+            if not math.isfinite(fee) or fee < 0:
+                raise ValueError
         except (TypeError, ValueError):
-            fee = 0
+            raise AkoolUpstreamError("Fee quote is unavailable or invalid; no generation was submitted",
+                                     code="AKOOL_HTTP_ERROR", status_code=502, details={"invalid_fee_quote": True}) from None
         return {"fee": fee, "request": request_body, "response": body}
 
     def generate(self, upstream_request: dict[str, Any]) -> dict[str, Any]:
@@ -1062,54 +1143,59 @@ class AkoolClient:
         }
 
     def generation_detail(self, resource_id: str) -> dict[str, Any]:
-        cursor = ""
-        for _ in range(5):
-            params: dict[str, Any] = {"type": 15, "size": 20, "media_type": "video"}
-            if cursor:
-                params["cursor"] = cursor
-            body, _ = self._request("GET", LIST_PATH, params=params, retry=True)
-            body = self._require_ok(body, "task list")
-            data = body.get("data") or {}
-            for item in data.get("result") or []:
-                if isinstance(item, dict) and str(item.get("_id") or "") == str(
-                    resource_id
-                ):
-                    status_value = int(item.get("video_status") or 0)
+        lookup = begin_lookup(self.account.get("id"), resource_id,
+                              private_cache=self._lookup_private_cache)
+        try:
+            while (cursor := lookup.next_cursor()) is not None:
+                params: dict[str, Any] = {"type": 15, "size": 20, "media_type": "video"}
+                if cursor:
+                    params["cursor"] = cursor
+                body, _ = self._request("GET", LIST_PATH, params=params, retry=True)
+                body = self._require_ok(body, "task list")
+                data = body.get("data") or {}
+                if not isinstance(data, dict) or not isinstance(data.get("result", []), list):
+                    raise AkoolUpstreamError("Task list returned an invalid result structure",
+                                             code="AKOOL_HTTP_ERROR", status_code=502)
+                for item in data.get("result") or []:
+                    if not isinstance(item, dict) or str(item.get("_id") or "") != str(resource_id):
+                        continue
+                    try:
+                        raw_status = item.get("video_status")
+                        if raw_status is None:
+                            raw_status = item.get("status")
+                        status_value = int(raw_status or 0)
+                    except (ValueError, TypeError):
+                        raise AkoolUpstreamError("Task returned an invalid generation status",
+                                                 code="AKOOL_HTTP_ERROR", status_code=502) from None
                     reason = failure_reason(item)
                     if status_value != 3 and is_rate_limit_message(reason):
                         raise AkoolRateLimited(reason, details=item)
                     status = {1: "PENDING", 2: "PROCESSING", 3: "COMPLETE"}.get(
-                        status_value,
-                        (
-                            "FAILED"
-                            if status_value >= 4
-                            or failure_reason(item) != "Akool generation failed"
-                            else "PROCESSING"
-                        ),
-                    )
-                    progress = float(
-                        item.get("progress") or (100 if status == "COMPLETE" else 0)
-                    )
-                    return {
-                        "generationId": resource_id,
+                        status_value, "FAILED" if status_value >= 4 or reason != "Akool generation failed" else "PROCESSING")
+                    try:
+                        raw_progress = item.get("progress")
+                        if raw_progress is None or raw_progress == "":
+                            raw_progress = 100 if status == "COMPLETE" else 0
+                        if isinstance(raw_progress, bool):
+                            raise ValueError
+                        progress = float(raw_progress)
+                        if not math.isfinite(progress):
+                            raise ValueError
+                    except (ValueError, TypeError):
+                        raise AkoolUpstreamError("Task returned an invalid generation progress",
+                                                 code="AKOOL_HTTP_ERROR", status_code=502) from None
+                    lookup.found()
+                    return {"generationId": resource_id,
                         "providerTaskId": str(item.get("task_id") or ""),
                         "batchId": str(item.get("batch_id") or ""),
-                        "status": status,
-                        "providerStatus": status_value,
-                        "progress": progress,
-                        "urls": result_urls(item),
-                        "error": "" if status != "FAILED" else failure_reason(item),
-                        "raw": item,
-                    }
-            cursor = str(data.get("next_cursor") or "")
-            if not cursor:
-                break
-        return {
-            "generationId": resource_id,
-            "status": "PROCESSING",
-            "providerStatus": 0,
-            "progress": 0,
-            "urls": [],
-            "error": "",
-            "raw": {"not_found_in_recent_pages": True},
-        }
+                        "status": status, "providerStatus": status_value,
+                        "progress": progress, "urls": result_urls(item),
+                        "error": "" if status != "FAILED" else reason, "raw": item}
+                lookup.observe(data.get("next_cursor"))
+            return {"generationId": resource_id, "status": "PROCESSING", "providerStatus": 0,
+                    "progress": 0, "urls": [], "error": "",
+                    "raw": {"not_found_in_recent_pages": True, "lookup": lookup.finish()}}
+        finally:
+            # Save only completed reads. Query interruptions never imply a failed
+            # generation or permission to submit another paid request.
+            lookup.finish()

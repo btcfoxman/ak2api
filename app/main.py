@@ -387,7 +387,7 @@ def tasks(limit: int = Query(20, ge=1, le=100)) -> list[dict[str, Any]]:
 
 @app.post("/api/tasks", dependencies=[Depends(_admin_token)])
 def create_admin_task(payload: GenerationTaskCreate) -> dict[str, Any]:
-    return _create(payload.model_dump(exclude_none=True))
+    return _create(payload.model_dump(exclude_none=True, exclude_unset=True))
 
 
 @app.delete("/api/tasks", dependencies=[Depends(_admin_token)])
@@ -476,7 +476,8 @@ def integration_docs() -> Response:
 {models_markdown}
 - 渠道最大素材上限：{channel_limits['images']} 图、{channel_limits['videos']} 视频、{channel_limits['audio']} 音频；各模型按上表限制
 - 视频参考策略：{video_policy}
-- 未传入图片或视频时，网关会按账号复用内置 1024×1024 黑图，将文生视频请求转换为上游兼容的图生视频请求；黑图不会写入提示词或 `prompt_info`
+- 旧模型及 Kling 未传入图片或视频时，网关按账号复用内置 1024×1024 黑图；Vidu Q4 按原生目录允许无图请求，不添加黑图。黑图不会写入提示词或 `prompt_info`
+- Kling 4.0 与 Vidu Q4 的音频时长按每条素材校验；混合参考最多 15 项。Vidu Q4 不接受视频参考，音频仅支持 MP3
 - 默认策略：超出素材数量时忽略多余项；设置中可切换为严格校验
 - 登录与任务协议始终使用账号绑定代理；提交前动态询价并预扣可用积分
 

@@ -238,6 +238,7 @@ def test_slow_pull_terminates_only_its_owned_process(puller, monkeypatch, tmp_pa
 
 
 def prepare_main(puller, monkeypatch, tmp_path, *, index=False):
+    monkeypatch.setattr(puller, 'native_cached_pull', lambda *args, **kwargs: None)
     root = tmp_path / "deploy"
     root.mkdir()
     expected = "/home/btcfoxman/docker/ak2api"

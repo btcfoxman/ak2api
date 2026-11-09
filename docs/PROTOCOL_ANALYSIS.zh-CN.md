@@ -1,5 +1,25 @@
 # Akool 协议链路摘要
 
+2026-11-09 账号浏览器的补充记录确认：
+
+- 首次生成前的 “Before you continue” 内容权利确认由前端读取
+  `localStorage["akool-generation-consent"]`，值为 `"true"` 表示已确认。
+  当前组件没有后台接受接口或服务端协议版本。登录身份验证成功后，在同一浏览器
+  写入并回读该标记；已有标记保持不变。本地机制摘要仅供审计，不作为上游回执。
+  不点击 Continue，因为它会恢复先前被拦截的生成操作。查询已受理任务不依赖该标记。
+- Kling 4.0 使用 `kwaivgi/kling-v4.0/reference-to-video`，Vidu Q4 使用
+  `vidu/q4-preview/reference-to-video`；两者的 `model_mode` 均为 `references`。
+  Kling 提交不传 `audio_type` 或 `generate_audio`，保留默认音画同出；询价单独使用
+  官网的 `options.generate_audio=false`。Vidu 不接受参考视频，参考音频仅接受 MP3。
+  两者的音频时长限制按每条素材校验，而非累计；具体能力由模型目录公开。
+- 上传后的 profile `duration` 单位为毫秒。HTTP 200 的提交仍可能以业务码 1003
+  拒绝参数，不能据此认定已受理，也不能把素材拒绝当成登录失效。
+- 官网账户级 SSE 事件只触发资源列表刷新，不提供按任务 ID 查询的新接口。
+  程序继续按资源 ID 查询列表：每轮检查最近页并续查最多四个历史页，跨轮保留
+  同一账号、同一资源的游标。暂未找到时继续查询，不重放生成提交。
+- 已受理任务的 `video_status=4` 是明确失败；图片格式拒绝按素材错误返回。
+  `video_status=0` 不能被外层资源 `status=3` 覆盖而误报生成完成。
+
 实现依据为 2026-08-27 原生 CDP 记录，不使用 Playwright。敏感 Cookie、JWT、上传签名和账密不进入仓库。
 
 1. 浏览器在 `akool.com` 登录，网站脚本提交账密、动态 Turnstile token 和浏览器信息。

@@ -47,7 +47,7 @@ def verify(image):
                 'last_readiness_probe':last_probe.replace(token,'[fixture-token]')}),flush=True)
             raise AssertionError('isolated application did not become healthy; see fixture-only startup diagnostics')
         source=r'''
-import http.cookies,json,time,urllib.request,urllib.error
+import http.cookies,http.server,json,time,threading,urllib.request,urllib.error
 import websocket
 from app.browser_context import _CDP,_cdp_json
 BASE='http://127.0.0.1:8795'
@@ -112,12 +112,104 @@ finally:
  if page:page.close()
  if target:browser.call('Target.closeTarget',{'targetId':target})
  browser.close()
+# Verify the real localStorage primitive on an entirely synthetic, offline
+# origin. Only this fixture process overrides the fixed production origin.
+from app import browser_context as consent_context
+consent_http={'posts':0}
+class ConsentFixture(http.server.BaseHTTPRequestHandler):
+ def do_GET(self):
+  body=b'<!doctype html><html><body><button id="generate" data-generation-action="true">Synthetic generation</button></body></html>'
+  self.send_response(200);self.send_header('Content-Type','text/html');self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write(body)
+ def do_POST(self):
+  consent_http['posts']+=1;self.send_response(403);self.end_headers()
+ def log_message(self,*args):pass
+server=http.server.ThreadingHTTPServer(('127.0.0.1',0),ConsentFixture)
+thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+fixture_origin='http://ak-offline-fixture:'+str(server.server_port)
+real_origin=consent_context.GENERATION_CONSENT_ORIGIN
+browser=_CDP(_cdp_json(19800+aid,'/json/version')['webSocketDebuggerUrl'])
+target=None;page=None;consent_report={}
+try:
+ target=browser.call('Target.createTarget',{'url':'about:blank'})['targetId']
+ tab=next(item for item in _cdp_json(19800+aid,'/json/list')if item['id']==target)
+ page=_CDP(tab['webSocketDebuggerUrl']);page.call('Network.enable');page.call('Page.enable')
+ page.call('Page.navigate',{'url':fixture_origin+'/'})
+ for _ in range(50):
+  ready=page.evaluate("({origin:location.origin,ready:document.readyState})")or{}
+  if ready.get('origin')==fixture_origin and ready.get('ready')=='complete':break
+  time.sleep(.1)
+ assert ready.get('origin')==fixture_origin and ready.get('ready')=='complete'
+ page.evaluate(r"""(() => {
+   window.__consentWrites=0;window.__consentClicks=0;window.__consentResumes=0;
+   window.__realConsentSet=Storage.prototype.setItem;window.__realConsentGet=Storage.prototype.getItem;
+   window.__pendingSyntheticGeneration={resume:()=>{window.__consentResumes++}};
+   document.querySelector('#generate').addEventListener('click',()=>{window.__consentClicks++});
+   Storage.prototype.setItem=function(key,value){window.__consentWrites++;return window.__realConsentSet.call(this,key,value)};
+   return true;
+ })()""")
+ consent_context.GENERATION_CONSENT_ORIGIN=fixture_origin
+ key=json.dumps(consent_context.GENERATION_CONSENT_KEY)
+ def set_marker(value):
+  if value is None:page.evaluate("localStorage.removeItem("+key+");window.__consentWrites=0")
+  else:page.evaluate("window.__realConsentSet.call(localStorage,"+key+","+json.dumps(value)+");window.__consentWrites=0")
+ def counters():
+  return page.evaluate("({writes:window.__consentWrites,clicks:window.__consentClicks,resumes:window.__consentResumes})")
+ set_marker('true')
+ assert consent_context.ensure_generation_consent(page)['written']is False
+ assert consent_context.ensure_generation_consent(page)['written']is False
+ assert counters()=={'writes':0,'clicks':0,'resumes':0}
+ consent_report['already_true_marker_writes']=0
+ for label,value in [('false','false'),('missing',None)]:
+  set_marker(value)
+  receipt=consent_context.ensure_generation_consent(page)
+  assert receipt['written']is True and receipt['server_acknowledgement']is False
+  assert page.evaluate('localStorage.getItem('+key+')')=='true'
+  assert counters()=={'writes':1,'clicks':0,'resumes':0}
+  consent_report[label+'_marker_writes']=1
+ set_marker('false')
+ page.evaluate("Storage.prototype.setItem=function(){throw new DOMException('fixture storage denied','SecurityError')}")
+ try:
+  consent_context.ensure_generation_consent(page)
+  raise AssertionError('blocked localStorage unexpectedly prepared agreement')
+ except consent_context.AkoolBrowserConsentError:pass
+ assert page.evaluate('localStorage.getItem('+key+')')=='false'
+ assert counters()=={'writes':0,'clicks':0,'resumes':0}
+ consent_report['blocked_storage_rejected']=True
+ page.evaluate("Storage.prototype.setItem=function(){window.__consentWrites++}")
+ try:
+  consent_context.ensure_generation_consent(page)
+  raise AssertionError('failed marker readback unexpectedly prepared agreement')
+ except consent_context.AkoolBrowserConsentError:pass
+ assert counters()=={'writes':1,'clicks':0,'resumes':0}
+ consent_report['failed_readback_rejected']=True
+ page.evaluate("Storage.prototype.setItem=function(key,value){window.__consentWrites++;return window.__realConsentSet.call(this,key,value)};window.__consentWrites=0")
+ consent_context.GENERATION_CONSENT_ORIGIN=real_origin
+ try:
+  consent_context.ensure_generation_consent(page)
+  raise AssertionError('wrong origin unexpectedly prepared agreement')
+ except consent_context.AkoolBrowserConsentError:pass
+ assert counters()=={'writes':0,'clicks':0,'resumes':0}
+ consent_report['wrong_origin_rejected']=True
+ consent_context.GENERATION_CONSENT_ORIGIN=fixture_origin
+ try:
+  consent_context._verified_context(page,{'email':'expected@example.invalid'},None,
+    {'data':{'user':{'email':'different@example.invalid','_id':'different-user'}}})
+  raise AssertionError('wrong identity unexpectedly reached localStorage')
+ except consent_context.AkoolBrowserError:pass
+ assert counters()=={'writes':0,'clicks':0,'resumes':0}
+ assert consent_http['posts']==0
+ consent_report.update(identity_checked_before_storage=True,synthetic_button_clicks=0,pending_action_resumes=0,post_requests=0)
+finally:
+ consent_context.GENERATION_CONSENT_ORIGIN=real_origin
+ if page:page.close()
+ if target:browser.call('Target.closeTarget',{'targetId':target})
+ browser.close();server.shutdown();server.server_close();thread.join(timeout=3)
 assert request('POST',f'/api/account-login/{sid}/cancel',{})[0]==200
 assert request('GET','/account-login/credentials',cookie=cookie)[0]in{401,403}
 assert request('GET','/api/account-login')[1]['active']is None
 print(json.dumps({'app_healthy':True,'desktop_available':True,'real_chrome_xvfb_vnc_started':True,
  'authenticated_same_origin_viewer':True,'live_websocket_rfb_handshake':True,'real_browser_novnc_connected':True,'ticket_revoked_on_cancel':True,
- 'unauthenticated_and_cross_site_rejected':True,'external_network':'disabled','generation_posts':0}))
+ 'unauthenticated_and_cross_site_rejected':True,'generation_consent':consent_report,'external_network':'disabled','generation_posts':0}))
 '''.replace('__TOKEN__',repr(token))
         report=json.loads(run(['docker','exec','-i',name,'python','-B','-'],input=source,timeout=160))
         print(json.dumps(report))

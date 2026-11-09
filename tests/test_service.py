@@ -67,6 +67,25 @@ def test_moderation_failure_matches_upstream_variants(message) -> None:
     ) == PUBLIC_MODERATION_FAILURE
 
 
+@pytest.mark.parametrize("code,message,expected", [
+    ("GENERATION_FAILED", "Image upload failed or format not supported. Please re-upload the image.",
+     "素材不符合尺寸、格式、时长等要求，请调整重试~"),
+    ("CONTENT_MODERATION_FAILED", "Image upload failed or format not supported. Please re-upload the image.",
+     "素材不符合尺寸、格式、时长等要求，请调整重试~"),
+    ("PROVIDER_INVALID_REQUEST", "Unknown validation failure",
+     "素材不符合尺寸、格式、时长等要求，请调整重试~"),
+    ("PROVIDER_INVALID_REQUEST", "Audio reference duration must be between 3s and 12s",
+     "素材时长不支持，请修改后再试~"),
+    ("MEDIA_DOWNLOAD_FAILED", "Connection aborted",
+     "素材下载失败，请检查素材链接后重试~"),
+    ("GENERATION_FAILED", "Input 'audio_3' could not be fetched from 'media.example.com'",
+     "素材下载失败，请检查素材链接后重试~"),
+    ("AKOOL_AUTH_REQUIRED", "登录已过期，请先登录", "上游维护中，请稍后再试~"),
+])
+def test_public_failure_messages_match_the_canonical_caller_contract(code, message, expected):
+    assert AKService.public_failure_message({"error_code": code, "error_message": message}) == expected
+
+
 def settings(tmp_path) -> SimpleNamespace:
     return SimpleNamespace(
         task_workers=2,
@@ -545,6 +564,48 @@ def test_real_generation_failure_is_still_terminal(tmp_path, monkeypatch) -> Non
     assert task["status"] == "failed"
     assert task["error_code"] == "GENERATION_FAILED"
     assert db.get_account(account["id"])["active_tasks"] == 0
+
+
+@pytest.mark.parametrize("reason,code,message", [
+    ("Image upload failed or format not supported. Please re-upload the image.", "PROVIDER_INVALID_REQUEST",
+     "素材不符合尺寸、格式、时长等要求，请调整重试~"),
+    ("Audio reference duration must be between 5s and 30s", "MEDIA_DURATION_FAILED",
+     "素材时长不支持，请修改后再试~"),
+    ("参考音频下载失败，请检查素材链接", "MEDIA_DOWNLOAD_FAILED",
+     "素材下载失败，请检查素材链接后重试~"),
+    ("输入图片版权审核未通过", "CONTENT_MODERATION_FAILED",
+     "检测到视频有敏感或违规内容，请修改后重试，积分已返还～"),
+])
+def test_terminal_provider_failure_is_classified_without_login_or_resubmission(
+    tmp_path, monkeypatch, reason, code, message
+):
+    db = Database(str(tmp_path / "classified-failure.db"))
+    account = db.upsert_account({"name": "one", "status": "active", "last_balance": 100})
+    db.create_task("failed", {"kind": "video", "model": "doubao-seedance-2-0-mini-260615", "prompt": "test"})
+    submissions = []
+
+    class FailedClient(FakeAkoolClient):
+        def generate(self, request):
+            submissions.append(request)
+            return super().generate(request)
+
+        def generation_detail(self, generation_id):
+            return {"status": "FAILED", "error": reason}
+
+    monkeypatch.setattr(service_module, "AkoolClient", FailedClient)
+    gateway = AKService(db, settings(tmp_path))
+    monkeypatch.setattr(gateway, "_recover_client", lambda *args: pytest.fail("validation/moderation is not a login failure"))
+    try:
+        gateway._run_task("failed")
+        task = db.get_task("failed")
+        assert task["status"] == "failed" and task["error_code"] == code
+        assert task["error_message"] == reason
+        assert gateway.public_task(task)["error"]["message"] == message
+        assert len(submissions) == 1
+        assert db.get_account(account["id"])["status"] == "active"
+        assert db.get_account(account["id"])["active_tasks"] == 0
+    finally:
+        gateway.stop()
 
 
 @pytest.mark.parametrize("error_code", ["RATE_LIMITED", "PROVIDER_INVALID_REQUEST", "GENERATION_FAILED"])

@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import tarfile
 import tempfile
@@ -75,7 +76,7 @@ def read_bounded(url,proxy,headers=None,limit=2097152):
     if len(value)>limit:raise RuntimeError('registry_metadata_too_large')
     return value
 
-def configured_proxy():
+def daemon_proxy():
     raw=command(['docker','info','--format','{{json .HTTPSProxy}}'],stage='docker_proxy_info').decode().strip()
     proxy=json.loads(raw)if raw else''
     if not proxy:
@@ -85,6 +86,15 @@ def configured_proxy():
     parsed=urllib.parse.urlsplit(proxy)
     if parsed.scheme not in{'http','https'}or not parsed.hostname or not parsed.port:raise RuntimeError('deployment_proxy_invalid')
     return proxy
+
+def configured_proxy():
+    proxy=daemon_proxy()
+    if proxy:return proxy
+    # The deployment worker is on this server; detect its actual local proxy.
+    try:
+        with socket.create_connection(('127.0.0.1',10809),timeout=.5):pass
+    except OSError:return ''
+    return 'http://127.0.0.1:10809'
 
 def basic_auth():
     path=Path(os.environ.get('DOCKER_CONFIG')or str(Path.home()/'.docker'))/'config.json'
@@ -304,6 +314,45 @@ def verify_loaded_image(info,config,revision):
     if type(info.get('Size'))is not int or info['Size']<=0:raise RuntimeError('loaded_image_size_invalid')
     return actual_id
 
+def native_cached_pull(reference,root,manifest,config,revision,cloud_size,samples,metadata_route,*,sampled_proxy=None):
+    """Use Docker's existing layer cache when it beats a complete archive transfer.
+
+    Docker verifies the pinned compressed digests; the same runtime config,
+    platform and uncompressed RootFS verification follows before any SHA tag.
+    A daemon cannot be switched by client HTTP_PROXY, so its real route is used.
+    """
+    route=daemon_proxy()or None
+    # A second daemon inspection may see a different configured proxy. A
+    # generic "proxy" sample cannot establish that unmeasured route's access.
+    if route and route!=sampled_proxy and metadata_route!=route:return None
+    route_name='proxy'if route else'direct'
+    sample_row=next((v for v in samples if v['route']==route_name),None)
+    if metadata_route!=route and not(sample_row and sample_row['complete']):return None
+    try:
+        current=json.loads(command(['docker','inspect','ak2api'],stage='docker_cache_container_info'))[0]
+        previous=json.loads(command(['docker','image','inspect',current['Image']],stage='docker_cached_rootfs_info'))[0]
+        cached=set((previous.get('RootFS')or{}).get('Layers')or[])
+    except (RuntimeError,ValueError,KeyError,IndexError):return None
+    layers=manifest['layers'];total=sum(v['size']for v in layers)
+    missing=sum(row['size']for row,diff in zip(layers,config['rootfs']['diff_ids'])if diff not in cached)
+    if not total or missing>total*.2:return None
+    native_bps=max((sample_row or{}).get('bytes_per_second',0),32768)
+    archive_bps=max((v['bytes_per_second']for v in samples if v['complete']),default=1)
+    if missing/native_bps+5>=total/max(archive_bps,1)+5:return None
+    # Native pulls reuse unpacked layers. Reserve a conservative whole-image
+    # allowance as well, before starting the bounded cache-assisted operation.
+    check_disk_budget(root,0,max(cloud_size*6,1024**3))
+    started=time.monotonic()
+    try:
+        command(['docker','pull','--platform','linux/amd64',reference],timeout=75,stage='docker_native_cached_pull')
+    except RuntimeError as error:
+        return {'success':False,'route':route_name,'failure_kind':str(error),'seconds':round(time.monotonic()-started,3)}
+    info=json.loads(command(['docker','image','inspect',reference],stage='docker_inspect_native_digest'))[0]
+    actual_id=verify_loaded_image(info,config,revision)
+    return {'success':True,'route':route_name,'image_id':actual_id,'info':info,
+        'seconds':round(time.monotonic()-started,3),'estimated_missing_compressed_bytes':missing,
+        'verification':'docker_engine_pinned_digest_and_verified_config_rootfs'}
+
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--image',required=True);parser.add_argument('--digest',required=True)
     parser.add_argument('--image-size',required=True,type=int)
@@ -351,6 +400,7 @@ def main():
             config_raw=candidate;break
         except Exception:continue
     if config_raw is None:raise RuntimeError('registry_verified_config_unavailable')
+    if len(config['rootfs']['diff_ids'])!=len(manifest['layers']):raise RuntimeError('image_layer_count_mismatch')
     layers=[row for row in manifest['layers']if row['size']>=1048576]
     if not layers:raise RuntimeError('image_transfer_sample_unavailable')
     layer=max(layers,key=lambda row:row['size'])
@@ -361,7 +411,17 @@ def main():
         raise RuntimeError('image_transfer_routes_unavailable')
     compressed=sum(row['size']for row in manifest['layers'])
     check_disk_budget(root,compressed,args.image_size)
-    with tempfile.TemporaryDirectory(prefix='verified-pull-',dir=root/'.pull-tools')as temporary:
+    reference='ghcr.io/'+repository+'@'+image_digest
+    native=native_cached_pull(reference,root,manifest,config,revision,args.image_size,samples,metadata_route,sampled_proxy=proxy)
+    if native and native['success']:
+        selected=native['route'];info=native['info'];actual_id=native['image_id']
+        archive_proof={'verification':native['verification'],'verified_layer_count':len(manifest['layers']),
+            'verified_expanded_bytes':None,'verified_compressed_layer_bytes':compressed,
+            'estimated_missing_compressed_bytes':native['estimated_missing_compressed_bytes']}
+    else:
+      if native:
+        ordered.sort(key=lambda pair:('proxy'if pair[0]else'direct')==native['route'])
+      with tempfile.TemporaryDirectory(prefix='verified-pull-',dir=root/'.pull-tools')as temporary:
         folder=Path(temporary);binary=acquire_tool(folder,[route for route,_ in ordered],root/'.pull-tools/cache')
         archive=folder/'image.tar';selected=None
         for route,_ in ordered:
@@ -386,11 +446,13 @@ def main():
         except RuntimeError:raise
         except (ValueError,TypeError,KeyError,IndexError,AttributeError):
             raise RuntimeError('docker_loaded_metadata_invalid')from None
-        command(['docker','tag',actual_id,args.image],stage='docker_tag_verified_revision')
+    command(['docker','tag',actual_id,args.image],stage='docker_tag_verified_revision')
     receipt={'image':args.image,'manifest_digest':args.digest,'platform_manifest_digest':image_digest,
         'loaded_config_digest':config_digest,'loaded_image_id':actual_id,'selected_route':selected,'route_samples':samples,
         'cloud_reported_image_size':args.image_size,'loaded_reported_image_size':info['Size'],
         'store_size_reporting_difference':info['Size']-args.image_size,'archive_proof':archive_proof,
+        'native_cache_attempt':{k:v for k,v in(native or{}).items()if k not in{'info','image_id'}},
+        'crane_used':not bool(native and native['success']),
         'crane_archive_sha256':TOOL_SHA,'docker_daemon_proxy_changed':False,'builds_or_dependency_installs':0}
     (root/'last-image-pull.safe.json').write_text(json.dumps(receipt,indent=2)+'\n')
     print(json.dumps(receipt))

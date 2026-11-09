@@ -11,6 +11,8 @@ RESOLUTION_ALIASES = {
     "standard": "480p",
     "480": "480p",
     "480p": "480p",
+    "540": "540p",
+    "540p": "540p",
     "hd": "720p",
     "720": "720p",
     "720p": "720p",
@@ -45,7 +47,23 @@ class ModelSpec:
     prompt_max_length: int = 20_000
     audio_type: int = 1
     include_generate_audio: bool = True
+    fee_generate_audio: bool | None = None
+    supports_extend_prompt: bool = True
     include_all_in_one_reference: bool = True
+    model_mode: str = ""
+    include_audio_type: bool = True
+    min_audio_seconds: int = 0
+    min_video_seconds: int = 0
+    max_reference_inputs: int = 0
+    default_aspect_ratio: str = ""
+    default_resolution: str = ""
+    default_duration: int = 0
+    audio_duration_per_item: bool = False
+    audio_content_types: tuple[str, ...] = ()
+    max_image_bytes: int = 0
+    max_video_bytes: int = 0
+    max_audio_bytes: int = 0
+    requires_text_video_image: bool = True
 
 
 MODEL_SPECS: dict[str, ModelSpec] = {
@@ -142,6 +160,64 @@ MODEL_SPECS: dict[str, ModelSpec] = {
         include_generate_audio=False,
         include_all_in_one_reference=False,
     ),
+    "kling-4.0": ModelSpec(
+        id="kling-4.0",
+        label="Kling 4.0",
+        upstream_model="kwaivgi/kling-v4.0/reference-to-video",
+        provider="maas",
+        durations=tuple(range(3, 31)),
+        resolutions=("720p", "1080p"),
+        aspect_ratios=("adaptive", "21:9", "16:9", "1:1", "9:16"),
+        max_images=10,
+        max_videos=5,
+        max_audio=3,
+        max_audio_seconds=30,
+        max_video_seconds=30,
+        generate_audio=True,
+        prompt_max_length=8000,
+        include_generate_audio=False,
+        fee_generate_audio=False,
+        supports_extend_prompt=False,
+        model_mode="references",
+        include_audio_type=False,
+        min_audio_seconds=5,
+        min_video_seconds=3,
+        max_reference_inputs=15,
+        default_aspect_ratio="adaptive",
+        default_resolution="720p",
+        default_duration=10,
+        audio_duration_per_item=True,
+        max_image_bytes=30_000_000,
+        max_video_bytes=300_000_000,
+        max_audio_bytes=50_000_000,
+    ),
+    "vidu-q4": ModelSpec(
+        id="vidu-q4",
+        label="Vidu Q4 Preview",
+        upstream_model="vidu/q4-preview/reference-to-video",
+        provider="maas",
+        durations=tuple(range(3, 17)),
+        resolutions=("540p", "720p", "1080p", "2k", "4k"),
+        aspect_ratios=("16:9", "9:16", "1:1", "3:4", "4:3"),
+        max_images=12,
+        max_videos=0,
+        max_audio=3,
+        max_audio_seconds=12,
+        max_video_seconds=0,
+        prompt_max_length=5000,
+        supports_extend_prompt=False,
+        model_mode="references",
+        include_audio_type=False,
+        min_audio_seconds=3,
+        max_reference_inputs=15,
+        default_aspect_ratio="16:9",
+        default_resolution="720p",
+        default_duration=5,
+        audio_duration_per_item=True,
+        audio_content_types=("audio/mpeg",),
+        max_audio_bytes=50_000_000,
+        requires_text_video_image=False,
+    ),
 }
 
 DEFAULT_MODEL_MAP = {
@@ -162,6 +238,10 @@ DEFAULT_MODEL_MAP = {
     "minimax-h3": "minimax-h3",
     "minimax/h3": "minimax-h3",
     "minimax/h3/reference-to-video": "minimax-h3",
+    "kling-4.0": "kling-4.0",
+    "kwaivgi/kling-v4.0/reference-to-video": "kling-4.0",
+    "vidu-q4": "vidu-q4",
+    "vidu/q4-preview/reference-to-video": "vidu-q4",
 }
 
 MEDIA_LIMITS = {
@@ -284,7 +364,7 @@ def _deduplicate(items: list[dict[str, str]]) -> list[dict[str, str]]:
 
 
 def _normalize_resolution(value: Any, spec: ModelSpec) -> str:
-    raw = str(value or spec.resolutions[0]).strip()
+    raw = str(value or spec.default_resolution or spec.resolutions[0]).strip()
     key = raw.lower().replace("-", "_").replace(" ", "_")
     normalized = RESOLUTION_ALIASES.get(key, raw)
     for supported in spec.resolutions:
@@ -324,7 +404,7 @@ def normalize_generation_request(
         raise ValueError("excess_media_policy must be ignore or strict")
     spec = model_spec(payload.get("model"), model_map)
     try:
-        duration = int(payload.get("duration") or spec.durations[0])
+        duration = int(payload.get("duration") or spec.default_duration or spec.durations[0])
     except (TypeError, ValueError) as exc:
         raise ValueError("duration must be an integer number of seconds") from exc
     if duration not in spec.durations:
@@ -335,8 +415,11 @@ def normalize_generation_request(
         payload.get("aspect_ratio")
         or payload.get("aspectRatio")
         or payload.get("ratio")
+        or spec.default_aspect_ratio
         or "adaptive"
     ).strip()
+    if ratio == "auto" and "adaptive" in spec.aspect_ratios:
+        ratio = "adaptive"
     if ratio not in spec.aspect_ratios:
         raise ValueError(
             f"{spec.id} aspect_ratio must be one of {', '.join(spec.aspect_ratios)}"
@@ -347,22 +430,29 @@ def normalize_generation_request(
     if len(prompt) > spec.prompt_max_length:
         raise ValueError(f"{spec.id} prompt exceeds {spec.prompt_max_length} characters")
 
+    image_inputs = _deduplicate(_direct_media(payload, "image") + _content_media(payload, "image"))
+    video_inputs = _deduplicate(_direct_media(payload, "video") + _content_media(payload, "video"))
+    audio_inputs = _deduplicate(_direct_media(payload, "audio") + _content_media(payload, "audio"))
+    if video_inputs and spec.max_videos == 0:
+        raise ValueError(f"{spec.id} does not support video references")
+    if spec.max_reference_inputs and sum(map(len, (image_inputs, video_inputs, audio_inputs))) > spec.max_reference_inputs:
+        raise ValueError(f"{spec.id} supports at most {spec.max_reference_inputs} reference inputs in total")
     images = _apply_media_limit(
-        _deduplicate(_direct_media(payload, "image") + _content_media(payload, "image")),
+        image_inputs,
         limit=spec.max_images,
         kind="images",
         spec=spec,
         policy=policy,
     )
     videos = _apply_media_limit(
-        _deduplicate(_direct_media(payload, "video") + _content_media(payload, "video")),
+        video_inputs,
         limit=spec.max_videos,
         kind="videos",
         spec=spec,
         policy=policy,
     )
     audio = _apply_media_limit(
-        _deduplicate(_direct_media(payload, "audio") + _content_media(payload, "audio")),
+        audio_inputs,
         limit=spec.max_audio,
         kind="audio files",
         spec=spec,
@@ -371,7 +461,7 @@ def normalize_generation_request(
     if cleanup_prompt_references:
         prompt = re.sub(r"[ \t]{2,}", " ", _REFERENCE_PATTERN.sub("", prompt)).strip()
 
-    requested_generate_audio = payload.get("generate_audio")
+    requested_generate_audio = payload.get("generate_audio") if spec.include_generate_audio else None
     generate_audio = spec.generate_audio and (
         True if requested_generate_audio is None else bool(requested_generate_audio)
     )
@@ -438,6 +528,17 @@ def public_models(model_map: Any = None) -> list[dict[str, Any]]:
                     },
                     "max_audio_seconds": spec.max_audio_seconds,
                     "max_video_seconds": spec.max_video_seconds,
+                    "min_audio_seconds": spec.min_audio_seconds,
+                    "min_video_seconds": spec.min_video_seconds,
+                    "max_reference_inputs": spec.max_reference_inputs,
+                    "audio_duration_per_item": spec.audio_duration_per_item,
+                    "audio_content_types": list(spec.audio_content_types),
+                    "media_size_limits_bytes": {"image": spec.max_image_bytes,
+                                                "video": spec.max_video_bytes,
+                                                "audio": spec.max_audio_bytes},
+                    "default_duration": spec.default_duration or spec.durations[0],
+                    "default_resolution": spec.default_resolution or spec.resolutions[0],
+                    "default_aspect_ratio": spec.default_aspect_ratio or "adaptive",
                 },
             }
         )

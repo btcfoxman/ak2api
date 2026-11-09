@@ -15,6 +15,7 @@ from app.browser_assist import browser_action, browser_snapshot, capture_browser
 from app.browser_context import (
     AkoolBrowserAccountSuspended,
     AkoolBrowserChallengeError,
+    AkoolBrowserConsentError,
     AkoolBrowserError,
     AkoolBrowserTransportError,
     delete_managed_profile,
@@ -25,6 +26,7 @@ from app.browser_context import (
 )
 from app.config import normalize_proxy_url
 from app.db import Database, now_ts
+from app.error_classification import classify_error_message, is_moderation_failure
 from app.akool_client import (
     AkoolAccountSuspended,
     AkoolAuthError,
@@ -40,6 +42,7 @@ from app.akool_client import (
 from app.model_catalog import (
     MEDIA_LIMITS,
     model_map_json,
+    model_spec,
     normalize_generation_request,
     public_models,
 )
@@ -48,21 +51,20 @@ LOGGER = logging.getLogger("ak2api.service")
 TERMINAL_STATUSES = {"succeeded", "failed", "expired"}
 TEXT_VIDEO_IMAGE_CACHE_KEY = "text_to_video_black_1024_v1"
 PUBLIC_FAILURE = "生成失败，积分已返还，请重试~"
-PUBLIC_MEDIA_FAILURE = "素材下载失败，请检查~"
-PUBLIC_MEDIA_DURATION_FAILURE = "素材时长不支持，请修改后再试"
-PUBLIC_FORMAT_FAILURE = "处理失败，请检查图音视频格式和大小"
+PUBLIC_MEDIA_FAILURE = "素材下载失败，请检查素材链接后重试~"
+PUBLIC_MEDIA_DURATION_FAILURE = "素材时长不支持，请修改后再试~"
+PUBLIC_FORMAT_FAILURE = "素材不符合尺寸、格式、时长等要求，请调整重试~"
 PUBLIC_MODERATION_FAILURE = "检测到视频有敏感或违规内容，请修改后重试，积分已返还～"
+PUBLIC_UPSTREAM_UNAVAILABLE = "上游维护中，请稍后再试~"
+PUBLIC_SUBMISSION_FAILURE = "视频生成提交失败，请稍后重试~"
 
 
 def _is_moderation_failure(message: Any) -> bool:
-    value = str(message or "").lower()
-    return any(
-        marker in value
-        for marker in (
-            "content was flagged by our moderation system",
-            "content violates safety rules",
-        )
-    )
+    return is_moderation_failure(message)
+
+
+def _is_agreement_failure(error: Exception) -> bool:
+    return isinstance(error, AkoolBrowserConsentError) or getattr(error, "code", None) == "AGREEMENT_REQUIRED"
 
 
 def _is_image_constraint_failure(message: Any) -> bool:
@@ -764,9 +766,15 @@ class AKService:
 
     def complete_manual_browser(self, account_id: int) -> dict[str, Any]:
         account = self._manual_browser_account(account_id)
-        context = capture_browser_session(account, self.settings)
-        self._persist_browser_context(account, context)
-        result = self.check_account(account_id, recover=False)
+        try:
+            context = capture_browser_session(account, self.settings)
+            self._persist_browser_context(account, context)
+            result = self.check_account(account_id, recover=False)
+        except Exception as exc:
+            if _is_agreement_failure(exc):
+                self.db.update_account(account_id, {"status": "agreement_required", "last_error": str(exc),
+                                                    "last_checked_at": now_ts()})
+            raise
         self.close_manual_browser(account_id)
         return result
 
@@ -778,12 +786,14 @@ class AKService:
                 previous = lease["previous"]
                 current = self.db.get_account(account_id) or {}
                 verified = False
+                agreement_error = None
                 try:
                     context = capture_browser_session(current, self.settings)
                     self._persist_browser_context(current, context)
                     verified = True
-                except Exception:
-                    pass
+                except Exception as exc:
+                    if _is_agreement_failure(exc):
+                        agreement_error = exc
                 enabled = verified and bool(
                     previous.get("enabled") and current.get("enabled")
                 )
@@ -792,7 +802,7 @@ class AKService:
                     lease["id"],
                     enabled=enabled,
                     status=(
-                        "active"
+                        "agreement_required" if agreement_error else "active"
                         if enabled
                         else (
                             previous["status"]
@@ -801,7 +811,7 @@ class AKService:
                         )
                     ),
                     error=(
-                        ""
+                        str(agreement_error) if agreement_error else ""
                         if verified
                         else "manual login closed without a verified matching session"
                     ),
@@ -867,7 +877,9 @@ class AKService:
             if isinstance(exc, (AkoolAccountSuspended, AkoolBrowserAccountSuspended)):
                 self._mark_account_suspended(account_id)
                 raise
-            if isinstance(exc, (AkoolBrowserChallengeError, AkoolRiskBlocked)):
+            if _is_agreement_failure(exc):
+                status = "agreement_required"
+            elif isinstance(exc, (AkoolBrowserChallengeError, AkoolRiskBlocked)):
                 status = "challenge_required"
             elif isinstance(exc, AkoolBrowserTransportError):
                 status = "network_error"
@@ -975,7 +987,7 @@ class AKService:
                 self._mark_account_suspended(account_id)
                 raise
             status = (
-                "login_required"
+                "agreement_required" if _is_agreement_failure(exc) else "login_required"
                 if isinstance(
                     exc, (AkoolAuthError, AkoolRiskBlocked, AkoolBrowserError)
                 )
@@ -1354,7 +1366,7 @@ class AKService:
                 + [("video", item) for item in payload.get("_videos") or []]
                 + [("audio", item) for item in payload.get("_audio") or []]
             )
-            needs_text_video_image = not any(
+            needs_text_video_image = model_spec(payload.get("model")).requires_text_video_image and not any(
                 kind in {"image", "video"} for kind, _ in sources
             )
             uploads = []
@@ -1795,10 +1807,17 @@ class AKService:
             raise TimeoutError("Akool generation timed out")
         except Exception as exc:
             code = getattr(exc, "code", "TASK_FAILED")
+            failure_kind = classify_error_message(exc)
             if isinstance(exc, TimeoutError):
                 code = "TASK_TIMEOUT"
-            elif _is_moderation_failure(exc):
+            elif failure_kind == "moderation":
                 code = "CONTENT_MODERATION_FAILED"
+            elif failure_kind == "media_duration":
+                code = "MEDIA_DURATION_FAILED"
+            elif failure_kind == "media_download":
+                code = "MEDIA_DOWNLOAD_FAILED"
+            elif failure_kind == "media_constraints":
+                code = "PROVIDER_INVALID_REQUEST"
             self.db.update_task(
                 task_id,
                 status="expired" if code == "TASK_TIMEOUT" else "failed",
@@ -1813,6 +1832,10 @@ class AKService:
                 (AkoolAccountSuspended, AkoolBrowserAccountSuspended),
             ):
                 self._mark_account_suspended(int(account["id"]))
+            elif account and _is_agreement_failure(exc):
+                self.db.update_account(int(account["id"]), {
+                    "status": "agreement_required", "last_error": str(exc), "last_checked_at": now_ts(),
+                })
             elif account and isinstance(
                 exc, (AkoolAuthError, AkoolRiskBlocked, AkoolBrowserError)
             ):
@@ -1895,21 +1918,29 @@ class AKService:
 
     @staticmethod
     def public_failure_message(task: dict[str, Any]) -> str:
-        code = str(task.get("error_code") or "")
-        if code == "CONTENT_MODERATION_FAILED" or _is_moderation_failure(
-            task.get("error_message")
-        ):
+        code = str(task.get("error_code") or "").upper()
+        failure_kind = classify_error_message(task.get("error_message"))
+        # Strong upstream evidence also corrects older generic/misclassified rows.
+        if failure_kind == "moderation":
             return PUBLIC_MODERATION_FAILURE
-        if re.search(
-            r"\bduration\s+must\s+be\s+between\s+\d+(?:\.\d+)?\s*s\s+and\s+\d+(?:\.\d+)?\s*s\b",
-            str(task.get("error_message") or ""),
-            re.I,
-        ):
+        if failure_kind == "media_duration":
+            return PUBLIC_MEDIA_DURATION_FAILURE
+        if failure_kind == "media_download":
+            return PUBLIC_MEDIA_FAILURE
+        if failure_kind == "media_constraints":
+            return PUBLIC_FORMAT_FAILURE
+        if code == "CONTENT_MODERATION_FAILED":
+            return PUBLIC_MODERATION_FAILURE
+        if code == "MEDIA_DURATION_FAILED":
             return PUBLIC_MEDIA_DURATION_FAILURE
         if code == "MEDIA_DOWNLOAD_FAILED":
             return PUBLIC_MEDIA_FAILURE
         if code == "PROVIDER_INVALID_REQUEST":
             return PUBLIC_FORMAT_FAILURE
+        if code == "AGREEMENT_REQUIRED":
+            return PUBLIC_SUBMISSION_FAILURE
+        if code in {"AKOOL_AUTH_REQUIRED", "AKOOL_RISK_BLOCKED", "AKOOL_ACCOUNT_SUSPENDED", "RATE_LIMITED", "NO_AVAILABLE_ACCOUNT"}:
+            return PUBLIC_UPSTREAM_UNAVAILABLE
         return PUBLIC_FAILURE
 
     def public_task(self, task: dict[str, Any]) -> dict[str, Any]:

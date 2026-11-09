@@ -36,7 +36,7 @@ jobs:
         run: |
           python -m pip install -r requirements.txt pytest httpx
           python -m pytest -q
-          node --test tests/test_online_account_ui.mjs
+          node --test tests/*.mjs
           node --check app/static/app.js
           node --check app/static/account-login.js
       - uses: docker/setup-buildx-action@v3
@@ -89,16 +89,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Isolate registry credentials for this deployment
+        run: echo "DOCKER_CONFIG=$RUNNER_TEMP/ak-registry-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+      - name: Prepare private short-lived registry authentication
+        env:
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.actor }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
-          registry_dir="${RUNNER_TEMP}/ak-registry-${GITHUB_RUN_ID}"
-          mkdir -p "$registry_dir"
-          chmod 700 "$registry_dir"
-          echo "DOCKER_CONFIG=$registry_dir" >> "$GITHUB_ENV"
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          python3 - <<'PY'
+          import base64,json,os,pathlib
+          root=pathlib.Path(os.environ['DOCKER_CONFIG'])
+          assert root.resolve().is_relative_to(pathlib.Path(os.environ['RUNNER_TEMP']).resolve())
+          root.mkdir(mode=0o700,exist_ok=False)
+          value=base64.b64encode((os.environ['GHCR_USERNAME']+':'+os.environ['GHCR_TOKEN']).encode()).decode()
+          path=root/'config.json'
+          path.write_text(json.dumps({'auths':{'ghcr.io':{'auth':value}}}))
+          path.chmod(0o600)
+          PY
       - name: Compare direct and configured proxy then import immutable image
         run: >-
           python3 scripts/pull_verified_image.py
@@ -119,3 +125,15 @@ jobs:
         run: |
           set -euo pipefail
           curl --noproxy '*' --fail --silent --show-error --retry 3 --retry-delay 3 --connect-timeout 5 --max-time 15 https://ak2api.aiid.edu.kg/health >/dev/null
+      - name: Remove only this job's registry credentials
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import os,pathlib
+          root=pathlib.Path(os.environ['DOCKER_CONFIG'])
+          assert root.resolve().is_relative_to(pathlib.Path(os.environ['RUNNER_TEMP']).resolve())
+          if root.exists():
+            assert not root.is_symlink() and root.name.startswith('ak-registry-')
+            (root/'config.json').unlink(missing_ok=True)
+            root.rmdir()
+          PY

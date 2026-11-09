@@ -2,7 +2,7 @@ const state = { accounts: [], tasks: [], models: [], settings: {}, accountFilter
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const terminal = new Set(["succeeded", "failed", "expired"]);
-const publicErrors = { CONTENT_MODERATION_FAILED: "检测到视频有敏感或违规内容，请修改后重试，积分已返还～", MEDIA_DOWNLOAD_FAILED: "素材下载失败，请检查~", PROVIDER_INVALID_REQUEST: "处理失败，请检查图音视频格式和大小" };
+const publicErrors = { AGREEMENT_REQUIRED: "视频生成提交失败，请稍后重试~", CONTENT_MODERATION_FAILED: "检测到视频有敏感或违规内容，请修改后重试，积分已返还～", MEDIA_DOWNLOAD_FAILED: "素材下载失败，请检查素材链接后重试~", MEDIA_DURATION_FAILED: "素材时长不支持，请修改后再试~", PROVIDER_INVALID_REQUEST: "素材不符合尺寸、格式、时长等要求，请调整重试~", AKOOL_AUTH_REQUIRED: "上游维护中，请稍后再试~", AKOOL_RISK_BLOCKED: "上游维护中，请稍后再试~", AKOOL_ACCOUNT_SUSPENDED: "上游维护中，请稍后再试~", RATE_LIMITED: "上游维护中，请稍后再试~", NO_AVAILABLE_ACCOUNT: "上游维护中，请稍后再试~" };
 
 function icons() { if (window.lucide) window.lucide.createIcons(); }
 function escapeHtml(value) { return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char])); }
@@ -20,11 +20,11 @@ function toast(message, error = false) { const item = $("#toast"); item.textCont
 function fmtTime(value) { return value ? new Date(Number(value) * 1000).toLocaleString() : "-"; }
 function fmtCost(value) { const number = Number(value || 0); return Number.isInteger(number) ? String(number) : number.toFixed(2).replace(/0+$/, "").replace(/\.$/, ""); }
 function elapsed(task) { const end = Number(task.completed_at || Date.now() / 1000); const total = Math.max(Math.floor(end - Number(task.created_at || end)), 0); return total < 60 ? `${total}秒` : `${Math.floor(total / 60)}分${total % 60}秒`; }
-function badge(status) { const labels = { active: "可用", pending: "待检测", login_pending: "待登录", logging_in: "登录中", login_failed: "登录失败", challenge_required: "需验证", profile_resetting: "重置中", queued: "排队", preparing: "准备", submitted: "已提交", running: "生成中", succeeded: "完成", failed: "失败", expired: "超时", login_required: "需登录", network_error: "网络异常", suspended: "上游封禁", disabled: "禁用", disabled_low_balance: "低额度" }; return `<span class="badge ${escapeHtml(status)}">${escapeHtml(labels[status] || status || "未知")}</span>`; }
+function badge(status) { const labels = { agreement_required: "协议待确认", active: "可用", pending: "待检测", login_pending: "待登录", logging_in: "登录中", login_failed: "登录失败", challenge_required: "需验证", profile_resetting: "重置中", queued: "排队", preparing: "准备", submitted: "已提交", running: "生成中", succeeded: "完成", failed: "失败", expired: "超时", login_required: "需登录", network_error: "网络异常", suspended: "上游封禁", disabled: "禁用", disabled_low_balance: "低额度" }; return `<span class="badge ${escapeHtml(status)}">${escapeHtml(labels[status] || status || "未知")}</span>`; }
 function proxyLabel(value) { try { const url = new URL(value); return `${url.hostname}:${url.port}`; } catch { return value || "直连"; } }
 function failureMessage(task) {
   if (/content (?:was flagged by our moderation system|violates safety rules)/i.test(task.error_message || "")) return publicErrors.CONTENT_MODERATION_FAILED;
-  if (/\bduration\s+must\s+be\s+between\s+\d+(?:\.\d+)?\s*s\s+and\s+\d+(?:\.\d+)?\s*s\b/i.test(task.error_message || "")) return "素材时长不支持，请修改后再试";
+  if (/\bduration\s+must\s+be\s+between\s+\d+(?:\.\d+)?\s*s\s+and\s+\d+(?:\.\d+)?\s*s\b/i.test(task.error_message || "")) return publicErrors.MEDIA_DURATION_FAILED;
   return publicErrors[String(task.error_code || "").toUpperCase()] || "生成失败，积分已返还，请重试~";
 }
 
@@ -73,7 +73,7 @@ function renderTasks() {
 function defaultPayload() {
   const model = state.models.find((item) => item.id === state.selectedModel) || state.models[0] || {};
   const capabilities = model.capabilities || {}; const limits = capabilities.media_limits || {};
-  const payload = { model: model.id || state.selectedModel, prompt: "保持参考主体一致，镜头平稳推进，画面自然连贯", duration: (capabilities.durations || [4])[0], resolution: (capabilities.resolutions || ["480p"])[0], aspect_ratio: (capabilities.aspect_ratios || ["adaptive"])[0], background: true };
+  const payload = { model: model.id || state.selectedModel, prompt: "保持参考主体一致，镜头平稳推进，画面自然连贯", duration: capabilities.default_duration || (capabilities.durations || [4])[0], resolution: capabilities.default_resolution || (capabilities.resolutions || ["480p"])[0], aspect_ratio: capabilities.default_aspect_ratio || (capabilities.aspect_ratios || ["adaptive"])[0], background: true };
   if (limits.images > 0) payload.image_urls = ["https://interactive-examples.mdn.mozilla.net/media/cc0-images/flower.jpg"];
   if (limits.videos > 0) payload.video_urls = [];
   if (limits.audio > 0) payload.audio_urls = [];

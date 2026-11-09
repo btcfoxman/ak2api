@@ -1,1 +1,22 @@
-{"app/__init__.py": "1c0bdbe1e870e01d1b134bde6a1778dfed1497bbd8d1fe2e772271d94613dc08", "app/akool_client.py": "e29d43016adfc2af4c21a0ffcd4136634ec58c0290e4434ad216fa6e496993d0", "app/browser_assist.py": "7d9a0633203e50772a848c0cfe2eced1408b097a53b967a99395cd94ec68f348", "app/browser_context.py": "91fcb5a9033b15d832c4da585594070672e780a9d40b36bcf37091eb85bc6591", "app/config.py": "d35ee7427c534b4924dca67f245bb9f563c57bab1a2a8bb4739a069f4b668550", "app/cookies.py": "b9d35ede9c303d91b51836580a54203d13a05adf0aabad05d148316f5712fdf6", "app/db.py": "80d8bdf318c022356343bcb25bc9f9d651af0d3a78828318b05c2875525d94e2", "app/main.py": "6b662a004c51607ec2c02cbab7ec4018ef89f8f0ffd3b407bcf119d59f937796", "app/model_catalog.py": "5cd46adde88ea07dce85226805f5f30188bb0aa2ee828bc30ec814dffa39940b", "app/schemas.py": "ad587cbdc56cc0fee608336885cde6410449b8335ed28625b3b6188a804f67a8", "app/service.py": "9974498d18e5d7813bad90807a07f43a213dc51a8b75f1eccf9d4745ca0bb0e0", "app/static/app.js": "0ec9cd877dd512e47e74fc687c75b4befba6274ab052beedcde97399198958f5", "app/static/browser-assist.js": "a0cc454dcf7e5bc7279734eb23dcb964d0a69540e0a96c4b9e0d331a2d525600", "app/static/index.html": "82c9b61ee568887716a863f2ddf61ba55f96cefa75911b840821f32d82be08c9", "app/static/styles.css": "b95d1ec7c60027dd22ce57bb26394e550ffc52eccd8669c466b4219ff25d727c"}
+{
+  "app/service.py": "130381dda6bd45cb440fcc385ad61ecafaa45909080538759a6bc4acbacb6bae",
+  "app/akool_client.py": "ea3bb820bf99e9f6e0de9a406df2c17c4b0843a431d5e9eab95dd1be3154146a",
+  "app/cookies.py": "b9d35ede9c303d91b51836580a54203d13a05adf0aabad05d148316f5712fdf6",
+  "app/browser_context.py": "96096c9f4c7b51fd286220ffb47de10300a97c22ee88f7badaade6529fb9cea5",
+  "app/browser_login.py": "4bb923eb235d0906d3b33317f36b51e221667167e8254264c15ee83dc9941e46",
+  "app/__init__.py": "1c0bdbe1e870e01d1b134bde6a1778dfed1497bbd8d1fe2e772271d94613dc08",
+  "app/main.py": "ca10cf46f2f57aeb5366df3b8c99204cffd6f262ec8bf3e6fbd9a66d537b91af",
+  "app/model_catalog.py": "5cd46adde88ea07dce85226805f5f30188bb0aa2ee828bc30ec814dffa39940b",
+  "app/db.py": "46bfa2af17dfe42c33a2ce8da069753586c82f93b51617441b8d12286d3cd91d",
+  "app/schemas.py": "ad587cbdc56cc0fee608336885cde6410449b8335ed28625b3b6188a804f67a8",
+  "app/login_desktop.py": "15b89ccc7e9e5a52b33d3fc8b4ea102e8932a5a2716a69db62343399a317552c",
+  "app/browser_login_api.py": "ecc7e38ccdb86e45105b8b3e23aaeca0d4e17b307cf4b6c4da9dce3e1cd187cd",
+  "app/browser_assist.py": "7d9a0633203e50772a848c0cfe2eced1408b097a53b967a99395cd94ec68f348",
+  "app/config.py": "d35ee7427c534b4924dca67f245bb9f563c57bab1a2a8bb4739a069f4b668550",
+  "app/static/browser-assist.js": "a0cc454dcf7e5bc7279734eb23dcb964d0a69540e0a96c4b9e0d331a2d525600",
+  "app/static/index.html": "ab139254e7f2b2ba1480b5468a14125168c29f1ab93820a938731e64310181ef",
+  "app/static/app.js": "11deac30ce0bbcc9b87cb49a9072cd9d0a89ee987d2f8dd9d24a9f8d37d96fe4",
+  "app/static/account-login.js": "8b4cf3fd2dfa73084b0334964a191454d6bf34abf6f852b0ef0a353df1f0d49d",
+  "app/static/styles.css": "1244bebd800b1b6dfa770b89bdbb7723e9f239c57886f6b6f6588de4946a752c",
+  "app/static/account-viewer.html": "9abee932ee4ef80c84484649500ed0087d53cf86becad37007d496ea94f8fdce"
+}

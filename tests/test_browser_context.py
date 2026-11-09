@@ -226,6 +226,8 @@ def test_verified_session_rejects_a_different_account_before_reading_cookies():
 def test_verified_session_only_captures_akool_domain_cookies(tmp_path):
     class Client:
         def evaluate(self, expression):
+            if "__akGenerationConsentPreconfirm" in expression:
+                return {"ok": True, "origin": "https://akool.com", "key": "akool-generation-consent", "value": "true", "written": False}
             return "test-browser"
 
         def call(self, method):

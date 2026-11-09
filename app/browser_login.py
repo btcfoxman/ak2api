@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 
 from app.browser_context import (
+    AkoolBrowserConsentError,
     browser_binding,
     capture_native_context,
     stop_idle_account_browser,
@@ -211,7 +212,14 @@ class BrowserLoginManager:
         account = self.store.get_account(lease["account_id"])
         if not account:
             raise LoginError("account not found", 404)
-        context = capture_native_context(account, self.service.settings)
+        try:
+            context = capture_native_context(account, self.service.settings)
+        except AkoolBrowserConsentError as exc:
+            self.store.update_account(lease["account_id"], {
+                "status": "agreement_required", "last_error": str(exc),
+                "last_checked_at": int(time.time()),
+            })
+            raise
         updated = self.store.apply_browser_context(
             lease["account_id"],
             context,
@@ -246,7 +254,8 @@ class BrowserLoginManager:
             except Exception as exc:
                 lease["phase"] = "login"
                 lease["last_identity_ok"] = False
-                raise LoginError(str(exc), 409) from exc
+                status = 503 if isinstance(exc, AkoolBrowserConsentError) or getattr(exc, "code", None) == "AGREEMENT_REQUIRED" else 409
+                raise LoginError(str(exc), status) from exc
             previous = lease["previous"]
             current = self.store.get_account(lease["account_id"]) or {}
             is_draft = bool(previous.get("online_draft"))
@@ -270,11 +279,20 @@ class BrowserLoginManager:
                     )
                 )
             )
+            # Keep the scheduler's lease until interactive control is revoked.
+            # A viewer shutdown failure does not invalidate the verified login.
+            try:
+                await lease["desktop"].revoke_viewer()
+            except asyncio.CancelledError:
+                lease["phase"] = "login"
+                raise
+            except Exception as exc:
+                lease["phase"] = "login"
+                raise LoginError("login viewer could not close; please retry", 503) from exc
             self.service.end_online_login(
                 lease["account_id"], lease["id"], enabled=enabled, status=status
             )
             self.store.update_account(lease["account_id"], {"online_draft": 0})
-            await lease["desktop"].revoke_viewer()
             self.active = None
             return self.store.get_account(lease["account_id"], include_secrets=False)
 
@@ -285,17 +303,20 @@ class BrowserLoginManager:
         if lease.get('desktop'):
             await lease['desktop'].revoke_viewer()
         verified = False
+        agreement_error = None
         try:
             if lease.get("desktop") and lease["desktop"].alive():
                 await asyncio.to_thread(self._capture, lease)
                 verified = True
+        except AkoolBrowserConsentError as exc:
+            agreement_error = exc
         except Exception:
             pass
         previous = lease["previous"]
         current = self.store.get_account(lease["account_id"]) or {}
         enabled = verified and bool(previous.get("enabled") and current.get("enabled"))
         status = (
-            "active"
+            "agreement_required" if agreement_error else "active"
             if enabled
             else (
                 previous["status"] if not previous.get("enabled") else "login_required"
@@ -307,7 +328,7 @@ class BrowserLoginManager:
             enabled=enabled,
             status=status,
             error=(
-                ""
+                str(agreement_error) if agreement_error else ""
                 if verified
                 else "login window closed without a verified matching session"
             ),
